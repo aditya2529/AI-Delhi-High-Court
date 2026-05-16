@@ -1,0 +1,47 @@
+/* Skeleton stylesheet. Tailwind config + design tokens land in Sara's frontend
+   sprint per the engineering backlog. */
+
+:root {
+  --color-bg:        #f7f8fa;
+  --color-fg:        #1d2330;
+  --color-fg-muted:  #5b6675;
+  --color-accent:    #1b6cb0;
+  --color-warn:      #b8860b;
+  --color-danger:    #b03a3a;
+  --radius-md:       10px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+.dhc-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 24px; background: #fff; border-bottom: 1px solid #e6e9ee;
+}
+
+.dhc-header h1 { font-size: 1.1rem; margin: 0; }
+
+.dhc-disclaimer-badge {
+  font-size: 0.78rem; color: var(--color-warn);
+  background: #fff5e1; border: 1px solid #f0d9a8;
+  padding: 4px 8px; border-radius: 999px;
+}
+
+.dhc-main { max-width: 640px; margin: 0 auto; padding: 24px 16px; }
+.dhc-lede { color: var(--color-fg-muted); margin: 4px 0 24px; }
+.dhc-footer { padding: 24px; text-align: center; color: var(--color-fg-muted); }
+.dhc-footer a { color: var(--color-accent); text-decoration: none; }
+
+@media (max-width: 600px) {
+  .dhc-header h1 { font-size: 1rem; }
+  .dhc-disclaimer-badge { font-size: 0.7rem; }
+}

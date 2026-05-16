@@ -1,0 +1,51 @@
+# Delhi HC Case Tracker — local dev compose. Production deploy lives separately.
+#
+#   docker compose -f infrastructure/docker-compose.yml up --build
+#
+# Brings up: backend (FastAPI on 8000), frontend (Next.js on 3000), redis (optional).
+# SQLite file lives on a host-mounted volume so data survives container restarts.
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/Dockerfile.backend
+    container_name: dhc-backend
+    env_file: ../.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend/data:/app/backend/data
+      - ../logs/backend:/app/logs/backend
+      - ../parsers/fixtures:/app/parsers/fixtures:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: infrastructure/docker/Dockerfile.frontend
+    container_name: dhc-frontend
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+      NEXT_PUBLIC_SITE_NAME: Delhi HC Case Tracker
+      NEXT_PUBLIC_DISCLAIMER_VERSION: v1.0
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: dhc-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
