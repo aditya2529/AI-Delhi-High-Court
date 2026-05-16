@@ -1,14 +1,23 @@
-/* Skeleton stylesheet. Tailwind config + design tokens land in Sara's frontend
-   sprint per the engineering backlog. */
+/* Delhi HC Case Tracker — global stylesheet.
+ *
+ * Tailwind layers + a small set of bespoke utility classes for the
+ * pre-existing disclaimer banner and footer (kept as-is, per the SearchFlow
+ * brief: "Disclaimer banner stays visible on every page. Already in
+ * layout.tsx — don't touch it.").
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
 :root {
-  --color-bg:        #f7f8fa;
-  --color-fg:        #1d2330;
-  --color-fg-muted:  #5b6675;
-  --color-accent:    #1b6cb0;
-  --color-warn:      #b8860b;
-  --color-danger:    #b03a3a;
-  --radius-md:       10px;
+  --color-bg: #f7f8fa;
+  --color-fg: #1d2330;
+  --color-fg-muted: #5b6675;
+  --color-accent: #1b6cb0;
+  --color-warn: #b8860b;
+  --color-danger: #b03a3a;
+  --radius-md: 10px;
 }
 
 * { box-sizing: border-box; }
@@ -25,6 +34,7 @@ html, body {
 
 .dhc-header {
   display: flex; align-items: center; justify-content: space-between;
+  gap: 12px;
   padding: 16px 24px; background: #fff; border-bottom: 1px solid #e6e9ee;
 }
 
@@ -34,6 +44,7 @@ html, body {
   font-size: 0.78rem; color: var(--color-warn);
   background: #fff5e1; border: 1px solid #f0d9a8;
   padding: 4px 8px; border-radius: 999px;
+  white-space: nowrap;
 }
 
 .dhc-main { max-width: 640px; margin: 0 auto; padding: 24px 16px; }
@@ -42,6 +53,12 @@ html, body {
 .dhc-footer a { color: var(--color-accent); text-decoration: none; }
 
 @media (max-width: 600px) {
+  .dhc-header { padding: 12px 16px; }
   .dhc-header h1 { font-size: 1rem; }
   .dhc-disclaimer-badge { font-size: 0.7rem; }
+}
+
+/* Respect prefers-reduced-motion for the spinner used in loading states. */
+@media (prefers-reduced-motion: reduce) {
+  .dhc-spin { animation: none !important; }
 }

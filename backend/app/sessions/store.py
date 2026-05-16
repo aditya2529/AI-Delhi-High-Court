@@ -21,6 +21,16 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+def _now() -> float:
+    """Indirect call to `time.time` so tests can monkeypatch the module
+    attribute and have it observed by all CourtSession instances.
+
+    `field(default_factory=time.time)` captures the function reference at
+    class-definition time — too early for monkeypatching to take effect.
+    """
+    return time.time()
+
+
 @dataclass
 class CourtSession:
     """Opaque container for everything we need to call the court site again."""
@@ -33,8 +43,8 @@ class CourtSession:
     case_type: str = ""
     case_number: str = ""
     year: int = 0
-    created_at: float = field(default_factory=time.time)
-    last_seen_at: float = field(default_factory=time.time)
+    created_at: float = field(default_factory=_now)
+    last_seen_at: float = field(default_factory=_now)
 
 
 class SessionStore(abc.ABC):
@@ -57,12 +67,22 @@ class InMemorySessionStore(SessionStore):
     """Single-node dict store with TTL eviction on get().
 
     Not thread-safe across processes — for production use Redis.
+
+    We also keep a small ring of recently-evicted session_ids (TTL evictions
+    only — explicit `delete()` does NOT count, since those are clean
+    consumption / restart events). This lets the route layer distinguish
+    "session timed out" (return body status=expired) from "this id was
+    never valid" (return 404). The ring is bounded to 1024 entries so a
+    pathological attacker can't grow it unbounded.
     """
+
+    _EVICTED_RING_MAX = 1024
 
     def __init__(self, ttl_seconds: int) -> None:
         self._ttl = ttl_seconds
         self._lock = asyncio.Lock()
         self._data: dict[str, CourtSession] = {}
+        self._recently_evicted: dict[str, float] = {}
 
     async def create(self, case_type: str, case_number: str, year: int) -> CourtSession:
         session = CourtSession(
@@ -82,6 +102,7 @@ class InMemorySessionStore(SessionStore):
                 return None
             if time.time() - s.created_at > self._ttl:
                 self._data.pop(session_id, None)
+                self._note_eviction(session_id)
                 return None
             s.last_seen_at = time.time()
             return s
@@ -93,3 +114,19 @@ class InMemorySessionStore(SessionStore):
     async def delete(self, session_id: str) -> None:
         async with self._lock:
             self._data.pop(session_id, None)
+
+    def was_recently_evicted(self, session_id: str) -> bool:
+        """True if this session_id was TTL-evicted (not explicitly deleted).
+
+        Sync-safe — read of a dict key under the GIL is atomic enough for
+        a single check. We don't take the async lock to keep this callable
+        from sync route helpers.
+        """
+        return session_id in self._recently_evicted
+
+    def _note_eviction(self, session_id: str) -> None:
+        """Bounded LRU-ish ring of recently-evicted ids. Drops oldest if full."""
+        if len(self._recently_evicted) >= self._EVICTED_RING_MAX:
+            oldest_id = next(iter(self._recently_evicted))
+            self._recently_evicted.pop(oldest_id, None)
+        self._recently_evicted[session_id] = time.time()

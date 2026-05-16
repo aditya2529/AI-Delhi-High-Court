@@ -32,6 +32,10 @@ class CaptchaIncorrectError(CourtClientError):
     """Upstream rejected the CAPTCHA text — refresh and let the user retry."""
 
 
+class OutboundDisabledError(CourtClientError):
+    """Sneha's kill-switch is off. Refuse to make outbound calls."""
+
+
 @dataclass
 class CaptchaFetchResult:
     image_bytes: bytes
