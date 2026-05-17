@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
+import structlog
 from alembic import command
 from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI, Request
@@ -26,7 +27,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.config import get_settings
 from app.db.session import dispose_engine, get_engine
 from app.utils.errors import ApiError, api_error_response, get_or_mint_request_id
-from app.utils.logging import configure_logging, get_logger
+from app.utils.logging import (
+    configure_logging,
+    get_logger,
+    reset_request_id,
+    set_request_id,
+)
 
 
 def _run_alembic_upgrade() -> None:
@@ -55,18 +61,38 @@ def _run_alembic_upgrade() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Startup: migrate + warm engine. Shutdown: dispose engine."""
+    """Startup: migrate + warm engine. Shutdown: dispose engine.
+
+    Logging is configured TWICE on purpose:
+      1. Before alembic runs, so any migration error surfaces with our
+         format (rid stamping, JSON envelope to the rotating file).
+      2. AFTER alembic finishes, because ``alembic.command.upgrade``
+         loads ``alembic.ini`` which calls
+         ``logging.config.fileConfig(..., disable_existing_loggers=True)``
+         — that wipes every handler we installed and resets the root
+         logger level. Without re-wiring, our ``RotatingFileHandler``
+         vanishes and ``LOG_FILE_BACKEND`` ends up at 0 bytes
+         (the founder's 2026-05-17 incident).
+    """
     settings = get_settings()
-    configure_logging(
-        log_level=settings.app_log_level, log_file=settings.log_file_backend
-    )
+
+    def _wire_logging() -> None:
+        configure_logging(
+            log_level=settings.app_log_level,
+            log_file=settings.log_file_backend,
+            log_file_outbound=settings.log_file_outbound,
+        )
+
+    _wire_logging()  # pass 1 — capture migration errors with our format.
     log = get_logger("app.startup")
     try:
         _run_alembic_upgrade()
-        log.info("startup.migration.ok")
     except Exception as exc:  # noqa: BLE001 — startup failures are fatal
+        _wire_logging()  # re-wire so the error line lands in the file too.
         log.error("startup.migration.fail", error=str(exc))
         raise
+    _wire_logging()  # pass 2 — undo alembic's fileConfig reset.
+    log.info("startup.migration.ok")
     # Build the engine eagerly so /ready works immediately.
     get_engine()
     log.info("startup.ready", version=app.version)
@@ -104,14 +130,30 @@ def create_app() -> FastAPI:
 
 
 def _install_request_id_middleware(app: FastAPI) -> None:
-    """Stamp every request with a request_id; echo it on the response."""
+    """Stamp every request with a request_id; echo it on the response.
+
+    Binds the id into THREE places so it reaches every logger flavour:
+      * ``request.state.request_id`` — for handlers / error envelopes.
+      * ``app.utils.logging`` contextvar — picked up by the stdlib
+        ``_RequestIdFilter`` so plain ``logging`` callers (uvicorn,
+        sqlalchemy, alembic) get tagged too.
+      * ``structlog.contextvars`` — picked up by ``merge_contextvars``
+        so any ``structlog.get_logger().info(...)`` carries the id
+        even when called from a sync helper inside the request.
+    """
     @app.middleware("http")
     async def _request_id_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
         request_id = get_or_mint_request_id(request)
         request.state.request_id = request_id
-        response = await call_next(request)
-        response.headers["X-Request-Id"] = request_id
-        return response
+        token = set_request_id(request_id)
+        structlog.contextvars.bind_contextvars(request_id=request_id)
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-Id"] = request_id
+            return response
+        finally:
+            structlog.contextvars.unbind_contextvars("request_id")
+            reset_request_id(token)
 
 
 def _install_error_handlers(app: FastAPI) -> None:

@@ -5,11 +5,13 @@ no RBAC. Real auth lands in v2 (OIDC/SAML — see Sneha's notes).
 """
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, Depends, Header, Query
+from fastapi import APIRouter, Depends, Header, Path as PathParam, Query
 from pydantic import BaseModel
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +25,18 @@ from app.sessions.store import InMemorySessionStore, SessionStore
 from app.utils.errors import ApiError
 
 router = APIRouter()
+
+# Max matching lines we'll return from /audit/by-request — protects against
+# pathological log files where the same id appears thousands of times.
+_AUDIT_MAX_LINES = 500
+
+# request_id values are minted as `uuid4().hex` (32 hex chars) or echoed
+# verbatim from `X-Request-Id` (trimmed to 64 chars in
+# ``app.utils.errors.get_or_mint_request_id``). We allow a generous safe
+# alphabet: alnum + hyphen + underscore + dot. Anything else is rejected
+# at the route boundary so we never grep with attacker-controlled regex
+# metacharacters or path-separator chars.
+_REQUEST_ID_SAFE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
 def _require_admin(
@@ -226,3 +240,133 @@ async def set_kill_switch(
 
 # Make sure Any is imported even if unused — keeps mypy happy if we extend.
 _ = Any
+
+
+# ─── /admin/audit/by-request/{request_id} ─────────────────────────────────
+
+
+class AuditByRequestResponse(BaseModel):
+    """Lines from the rotating backend log file that mention a request id.
+
+    Each entry is the raw log line as written to disk (JSON envelope from
+    ``app.utils.logging._JsonOrPassthroughFormatter``). The endpoint does
+    NOT parse the JSON — it greps and streams matching lines back. The
+    caller can decode if they want; we keep it raw so a corrupt line
+    (mid-rotation tear, partial write) never breaks the endpoint.
+    """
+
+    request_id: str
+    log_file: str
+    line_count: int
+    truncated: bool
+    lines: list[str]
+
+
+@router.get(
+    "/audit/by-request/{request_id}",
+    response_model=AuditByRequestResponse,
+    summary="Return backend log lines matching a request_id (grep over LOG_FILE_BACKEND).",
+    dependencies=[Depends(_require_admin)],
+)
+async def audit_by_request_id(
+    request_id: str = PathParam(
+        ...,
+        description=(
+            "Request id minted by the backend (32-hex uuid4) or echoed "
+            "from a client `X-Request-Id` header. Restricted to "
+            "[A-Za-z0-9._-]{1,128} so we never grep with attacker-"
+            "controlled regex metacharacters."
+        ),
+    ),
+    settings: Settings = Depends(get_settings),
+) -> AuditByRequestResponse:
+    """Stream the backend log file, return lines containing ``request_id``.
+
+    Why a grep over a file (and not a DB query):
+      The file IS the audit log — see the rationale in ``app/utils/logging.py``.
+      Adding a parallel DB table would just create a second source of
+      truth that drifts. The endpoint is a convenience grep, capped at
+      ``_AUDIT_MAX_LINES`` lines so a pathological match (a long-running
+      request that emitted thousands of structured rows) can't blow up
+      the response.
+
+    503 if ``LOG_FILE_BACKEND`` is unset — we want the operator to know
+    that file logging isn't even enabled, rather than silently returning
+    an empty list.
+
+    400 if the supplied ``request_id`` contains characters outside the
+    safe alphabet. This is a defence-in-depth check; FastAPI's path
+    converter already rejects ``/`` in path params.
+    """
+    log_file = settings.log_file_backend
+    if not log_file:
+        raise ApiError(
+            code="service_unavailable",
+            message=(
+                "backend file logging is disabled (LOG_FILE_BACKEND empty). "
+                "Cannot grep audit log."
+            ),
+            http_status=503,
+            retryable=False,
+            hint="set LOG_FILE_BACKEND in the backend env and restart.",
+        )
+
+    if not _REQUEST_ID_SAFE.match(request_id):
+        raise ApiError(
+            code="invalid_request",
+            message="request_id contains unsupported characters.",
+            http_status=400,
+            retryable=False,
+            hint="expected [A-Za-z0-9._-]{1,128}.",
+        )
+
+    matches, truncated = _grep_log_file(
+        log_path=Path(log_file),
+        needle=request_id,
+        cap=_AUDIT_MAX_LINES,
+    )
+    return AuditByRequestResponse(
+        request_id=request_id,
+        log_file=log_file,
+        line_count=len(matches),
+        truncated=truncated,
+        lines=matches,
+    )
+
+
+def _grep_log_file(
+    *, log_path: Path, needle: str, cap: int
+) -> tuple[list[str], bool]:
+    """Stream-read ``log_path`` line by line, return up to ``cap`` matches.
+
+    Returns ``(matches, truncated)`` where ``truncated`` is True iff we
+    stopped because we hit the cap (more matches may exist on disk).
+
+    A missing log file is treated as zero matches — the file may not
+    exist yet on a freshly-booted backend that hasn't served a request.
+    Permission errors propagate as a 503 ApiError so the operator sees
+    them rather than getting a misleading empty list.
+    """
+    if not log_path.exists():
+        return [], False
+
+    matches: list[str] = []
+    truncated = False
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                if needle in line:
+                    matches.append(line.rstrip("\n"))
+                    if len(matches) >= cap:
+                        # Peek one more byte to know whether we truncated.
+                        truncated = bool(fp.read(1))
+                        break
+    except OSError as exc:
+        raise ApiError(
+            code="service_unavailable",
+            message=f"could not read log file: {exc}",
+            http_status=503,
+            retryable=True,
+            hint=str(log_path),
+        ) from exc
+    return matches, truncated
