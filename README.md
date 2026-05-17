@@ -90,9 +90,34 @@ cd frontend && npm run dev
 docker compose -f infrastructure/docker-compose.yml up --build
 ```
 
-Backend serves on http://localhost:8000 (OpenAPI at `/api/v1/openapi.json`). Frontend on http://localhost:3000.
+Backend serves on http://localhost:8000 (OpenAPI at `/api/v1/openapi.json`). Frontend on http://localhost:3000 (or the next free port in 3000-3010; the dev launcher falls back automatically).
+
+> After pulling new commits, run `scripts/dev/check-env.ps1` (Windows) or `scripts/dev/check-env.sh` (Unix) to spot new env vars that need to be added to your local `.env` / `frontend/.env.local`.
 
 > Before deploying anywhere, complete the **Phase-0 spike** in [docs/EXECUTIVE-SUMMARY.md](docs/EXECUTIVE-SUMMARY.md). The court site's exact session / CAPTCHA / CSRF mechanics are unknown and gate every downstream task.
+
+### Environment files (two files, on purpose)
+
+Next.js does NOT read the repo-root `.env`. To keep the split clean and avoid drift, the repo uses two example files:
+
+| File | Read by | Contains |
+| ---- | ------- | -------- |
+| `.env.example` -> `.env` | FastAPI backend (Pydantic settings) | Backend-only vars (DB, sessions, outbound HTTP, kill-switch, `CLIENT_MODE`) |
+| `frontend/.env.example` -> `frontend/.env.local` | Next.js (build + dev server) | `NEXT_PUBLIC_*` vars only, including `NEXT_PUBLIC_CLIENT_MODE` |
+
+`setup.ps1` and `setup.sh` copy both. `scripts/dev/check-env.ps1` / `.sh` diff both against their example and exit non-zero if any key is missing.
+
+**Important:** `CLIENT_MODE` (backend) and `NEXT_PUBLIC_CLIENT_MODE` (frontend) MUST match. The "PRIVATE ALPHA - DO NOT SHARE" banner renders only when the frontend mirror is set to `real`. If you change one, change both, and restart `npm run dev` so Next.js re-inlines the value.
+
+### Common Windows issues
+
+- **`npm run dev` says `EADDRINUSE: address already in use :::3000`** — A stale Node process is holding port 3000. The dev launcher (`scripts/dev/dev-frontend.mjs`) now auto-falls-back to the next free port in 3000-3010, so this should be rare. If you want 3000 back:
+  ```powershell
+  netstat -ano | findstr :3000
+  Stop-Process -Id <pid>
+  ```
+- **`setup.ps1` fails with `string is missing the terminator` or `missing closing }`** — A contributor slipped a non-ASCII character (em-dash, smart quote) into a `.ps1` file and bypassed CI. Run `powershell -File scripts\dev\check-windows-scripts.ps1` to locate it. The script enforces UTF-8 BOM, CRLF, and ASCII-only on every `.ps1`/`.bat`/`.cmd` in the repo.
+- **PRIVATE ALPHA banner not rendering even though `CLIENT_MODE=real`** — Make sure `NEXT_PUBLIC_CLIENT_MODE=real` is set in `frontend/.env.local` (not the root `.env` — Next.js ignores that file). Restart `npm run dev` after changing it.
 
 ---
 
