@@ -353,3 +353,73 @@ class TestRefreshCaptcha:
         body = refresh.json()
         assert "captcha_image_b64" in body
         assert body["captcha_image_b64"] != init.json()["captcha_image_b64"]
+
+
+# ── Retry-on-same-session regression (founder report 2026-05-17) ──────────
+
+
+class TestRetryOnSameSession:
+    """A wrong captcha on a session must not break the next submit on the
+    same session.
+
+    Founder report 2026-05-17: "system always asking me for the second
+    time" — observed alongside three `search.submit.no_audit_row`
+    warnings. Root cause: `_latest_search_request_for` filters audit
+    rows to `('initialized','captcha_displayed')`, but the first failed
+    submit had already moved the row to `failed`. The second submit
+    then returned `session_not_found` (404), even though the session
+    itself was still valid.
+
+    Fix: when no eligible audit row exists but the session is alive,
+    mint a follow-on audit row inline and proceed. Pinned here so a
+    future refactor can't silently regress this.
+    """
+
+    async def test_wrong_then_right_captcha_succeeds(
+        self, async_client, valid_init_body
+    ):
+        """captcha_failed -> follow-up submit with correct captcha -> success.
+
+        Exercises the no_audit_row branch added 2026-05-17. Without the
+        fix, the second submit returns 404 session_not_found; with the
+        fix, it returns status=success and the parsed case body.
+        """
+        init = await async_client.post("/api/v1/search/init", json=valid_init_body)
+        if _stub_response(init):
+            pytest.xfail("search.init is a skeleton (501)")
+        sid = init.json()["session_id"]
+
+        # First submit: deliberately wrong. Body-level captcha_failed.
+        first = await async_client.post("/api/v1/search/submit", json={
+            "session_id": sid, "captcha_text": "WRONG",
+        })
+        assert first.status_code == 200
+        assert first.json()["status"] == "captcha_failed"
+
+        # Second submit on the SAME session_id with the correct answer.
+        # Pre-fix: returned 404 session_not_found. Post-fix: 200 with one
+        # of the valid body-level statuses (success / not_found / etc).
+        # We don't pin to status=success here because the underlying
+        # fixture file is owned by Maya's parser-pivot work and may be
+        # mid-rename; the no_audit_row contract under test is "second
+        # submit on a live session is NOT a 404", which is shape-only.
+        answer = await _math_answer_for_session(sid)
+        second = await async_client.post("/api/v1/search/submit", json={
+            "session_id": sid, "captcha_text": answer,
+        })
+        assert second.status_code == 200, (
+            f"retry on same session must not 404 — got {second.status_code} "
+            f"body={second.text!r}"
+        )
+        body = second.json()
+        assert body["status"] in {
+            "success", "not_found", "court_error", "captcha_failed", "expired"
+        }, (
+            f"retry must return a body-level status, not an error envelope; "
+            f"got body={body!r}"
+        )
+        # The critical pre-fix bug: 404 with error.code=session_not_found.
+        assert "error" not in body, (
+            f"retry on same session must not produce an error envelope; "
+            f"body={body!r}"
+        )

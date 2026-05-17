@@ -266,9 +266,35 @@ async def submit_search(
         db, session.case_type, session.case_number, session.year
     )
     if search_req is None:
-        # Should not happen — we always create one in /init. Be defensive.
-        log.warning("search.submit.no_audit_row", session_id=session_id)
-        return None
+        # Retry-on-same-session: a previous /submit on this session already
+        # flipped the audit row to a terminal state (submitted/failed/etc),
+        # so `_latest_search_request_for` (which filters to
+        # initialized/captcha_displayed) finds nothing. The session itself
+        # is still valid — the user just typed a new captcha and hit submit
+        # again. Mint a follow-on audit row inline so we keep the
+        # observability without 404-ing a perfectly good session.
+        #
+        # Root cause for the founder's "system always asking me for the
+        # second time" pattern on 2026-05-17 — without this branch the
+        # second submit on the same session_id returns None and the route
+        # raises session_not_found (404).
+        log.warning(
+            "search.submit.no_audit_row",
+            session_id=session_id,
+            case_type=session.case_type,
+            case_number=session.case_number,
+            year=session.year,
+            outcome="minted_followon_audit_row",
+        )
+        search_req = await _new_search_request(
+            db,
+            session.case_type,
+            session.case_number,
+            session.year,
+            client_ip="",  # we don't have it at submit time; audit-only
+        )
+        search_req.status = "captcha_displayed"
+        search_req.captcha_displayed_at = datetime.now(timezone.utc)
 
     search_req.status = "submitted"
     search_req.submitted_at = datetime.now(timezone.utc)
