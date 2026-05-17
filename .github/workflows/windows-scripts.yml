@@ -1,0 +1,80 @@
+name: Windows scripts
+
+# Guard against the foot-gun that broke the founder's first run: setup.ps1
+# (and any future .ps1 / .bat) silently authored on Mac/Linux with em-dashes
+# and LF endings, then exploding on Windows PowerShell 5.1.
+#
+# This workflow runs on every push/PR. Two jobs:
+#   1. lint  - run scripts/dev/check-windows-scripts.ps1 (cross-platform).
+#   2. smoke - actually invoke setup.ps1 on a real windows-latest runner so
+#              parse errors and missing-cmdlet errors are caught in CI, not
+#              by the next tester on their laptop.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.ps1'
+      - '**/*.psm1'
+      - '**/*.psd1'
+      - '**/*.bat'
+      - '**/*.cmd'
+      - '.gitattributes'
+      - '.github/workflows/windows-scripts.yml'
+      - 'scripts/dev/setup.ps1'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/*.ps1'
+      - '**/*.psm1'
+      - '**/*.psd1'
+      - '**/*.bat'
+      - '**/*.cmd'
+      - '.gitattributes'
+      - '.github/workflows/windows-scripts.yml'
+      - 'scripts/dev/setup.ps1'
+
+jobs:
+  lint:
+    name: Lint .ps1/.bat (ASCII + BOM + CRLF)
+    # Cross-platform: pwsh runs everywhere. Disable autocrlf so we lint the
+    # bytes that are actually in the repo, not whatever Git would rewrite to.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disable Git autocrlf before checkout
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v4
+      - name: Run linter
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/dev/check-windows-scripts.ps1
+
+  smoke-windows:
+    name: setup.ps1 parses on Windows PowerShell 5.1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse setup.ps1 with Windows PowerShell 5.1
+        # Use windows-builtin PS 5.1 explicitly (powershell.exe, not pwsh).
+        # We only PARSE — don't execute — to avoid pulling Python/npm in CI
+        # for a script-format check. A parse failure here means the file
+        # would fail on a tester's machine the moment they invoke it.
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path .\scripts\dev\setup.ps1).Path,
+              [ref]$tokens,
+              [ref]$errors) | Out-Null
+          if ($errors -and $errors.Count -gt 0) {
+              Write-Host "setup.ps1 has $($errors.Count) parse error(s):" -ForegroundColor Red
+              $errors | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+              exit 1
+          }
+          Write-Host "setup.ps1 parsed cleanly under Windows PowerShell 5.1." -ForegroundColor Green
+      - name: Re-run linter on Windows for parity
+        shell: powershell
+        run: powershell -NoProfile -File .\scripts\dev\check-windows-scripts.ps1

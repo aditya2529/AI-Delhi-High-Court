@@ -1,0 +1,66 @@
+# Default: let Git infer text vs binary and normalise on commit.
+* text=auto
+
+# ----------------------------------------------------------------------------
+# Windows scripts MUST be CRLF.
+#
+# Why: Windows PowerShell 5.1 (the default on Windows 10/11) is sensitive to
+# both line endings and encoding. LF-only files parse fragilely; the fix is
+# to force CRLF on checkout via the rules below.
+#
+# The companion encoding rule (UTF-8 with BOM + ASCII-only bytes) is enforced
+# by scripts/dev/check-windows-scripts.ps1, which runs in CI via the
+# windows-scripts workflow. We do NOT use `working-tree-encoding=UTF-8-BOM`
+# because git-for-windows ships an iconv build that rejects that encoding
+# name on some installs ("failed to encode 'foo.ps1' from UTF-8-BOM to
+# UTF-8"). The linter is more portable and gives a clearer error message.
+# ----------------------------------------------------------------------------
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Shell scripts must stay LF so /bin/sh and /usr/bin/env bash can exec them.
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Common source files: LF everywhere. Editors handle display either way.
+*.py text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.sql text eol=lf
+
+# Env example files: LF; never CRLF (parsers in Node/Python expect \n).
+.env* text eol=lf
+*.env text eol=lf
+
+# Treat known binaries as binary so Git does no EOL conversion on them.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
