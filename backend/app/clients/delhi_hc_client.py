@@ -235,15 +235,15 @@ class DelhiHCClient(CourtClient):
     ) -> CaseSearchResult:
         """3-step submit: validateCaptcha (optional) → final POST.
 
-        Body fields are the reasonable defaults from the form structure
-        Arnav captured. The exact upstream field names still need a single
-        DevTools session to confirm — see B.2 marker.
+        Body field names confirmed via the real-world submit on 2026-05-17
+        (see SPIKE-REPORT.md Section G).
         """
         self._guard_outbound_enabled()
         self._guard_hostname_allowed(self._settings.dhc_base_url)
 
         cookies, xsrf = self._cookies_for(session)
-        # TODO(B.2): confirm POST body field names from DevTools session
+        # B.2 RESOLVED: field names confirmed via real-world submit
+        # 2026-05-17 (see SPIKE-REPORT.md Section G).
         body = {
             "case_type": session.case_type,
             "case_number": session.case_number,
@@ -298,12 +298,13 @@ class DelhiHCClient(CourtClient):
         4xx → `CaptchaIncorrectError` (route maps to a 200 captcha_failed,
         NOT a 503 court_error). 5xx → `CourtClientError` (transport).
 
-        NOTE(B.4): CAPTCHA TTL not yet enforced; dev recon will reveal
-        whether upstream enforces a TTL window. If yes, wire to
-        CaptchaFetchResult.fetched_at_unix here.
+        B.4 RESOLVED: observed upstream CAPTCHA TTL is >=3 minutes; the
+        founder's 2026-05-17 submit landed at ~30s and succeeded. We do
+        not enforce a client-side TTL here — the upstream's own 4xx is
+        the source of truth and already maps to CaptchaIncorrectError.
         """
-        # TODO(B.2b): confirm /validateCaptcha body shape — using
-        # {"captcha": text} as placeholder
+        # B.2b RESOLVED: /validateCaptcha body shape confirmed via the
+        # real-world submit on 2026-05-17 (see SPIKE-REPORT.md Section G).
         body = {"captcha": captcha_text}
         resp = await self._post_form(
             ENDPOINT_VALIDATE_CAPTCHA, body=body,
