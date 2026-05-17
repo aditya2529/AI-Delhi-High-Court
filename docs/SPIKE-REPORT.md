@@ -1,6 +1,6 @@
 # Phase-0 Reconnaissance Spike Report — Delhi HC Case Tracker
 
-**Status:** Draft v0.1 (spike in-flight) · **Owner:** Arnav (Architecture) · **Date:** 2026-05-17
+**Status:** Draft v0.2 (post first real-world run) · **Owner:** Arnav (Architecture) · **Date:** 2026-05-17
 **Companion:** [`SPIKE-PROTOCOL.md`](./SPIKE-PROTOCOL.md) — the developer-with-browser playbook that closes the unknowns in Section B.
 **Scope:** Resolve the three `TO BE VERIFIED IN SPIKE` markers in [`architecture/STRATEGIES.md`](./architecture/STRATEGIES.md), close gates **G1** and **G4** in [`EXECUTIVE-SUMMARY.md`](./EXECUTIVE-SUMMARY.md), and ship a tuned `parse_confidence` floor recommendation for `DHCParserV1`.
 **Out of scope:** ToS legal verdict (Sneha, G2), DPDPA counsel opinion (G3), tester recruitment (G5), `DelhiHCClient` implementation (Arjun, post-spike).
@@ -134,6 +134,25 @@ The floor assumes the **synthetic fixtures are representative of the real distri
 
 Add a counter `parse_confidence_bucket_total{bucket=...}` with buckets `[0-0.4, 0.4-0.55, 0.55-0.7, 0.7-1.0]` so we can see the live distribution and prove (or kill) this floor in the pilot. This is a Maya story, not a Sprint 1 blocker.
 
+### C.6 CAPTCHA format — confirmed ARITHMETIC (real-world observation, 2026-05-17)
+
+> **Source:** Founder's `CLIENT_MODE=real` first-run against W.P.(C) 2344/2024. See [`DEMO-FEEDBACK.md`](./DEMO-FEEDBACK.md) item #6.
+
+**Confirmed format:** Delhi HC serves **arithmetic** CAPTCHAs, NOT alphanumeric text.
+- **Observed samples:** `"17 + 3 ="`, `"19 + 3 ="`
+- **Answer space:** positive integers, typically **1-3 digits** (e.g., `5+2=7`, `19+3=22`, `99+1=100`)
+- **Image content:** a simple math expression rendered as PNG/JPEG with the user expected to type the integer result
+
+**Invalidates prior assumption:** the team's pre-spike spec assumed CAPTCHA answers would be 3+ alphanumeric characters. That assumption was hardcoded in `CaptchaChallenge.tsx` (`minLength={3}` + two more sites), which broke the very first real submit when the correct answer `22` was rejected by HTML5 form validation. Backend Pydantic (`min_length=1`) and Zod schema (`min(1)`) were correct; only the UI component was wrong. Fixed live during the demo.
+
+**Implications**
+- **Parser / input layer:** must accept `min_length=1`, **never** assume any specific length. The 1-3 digit range is typical, not normative — defend against 4+ digit answers (`999+999=1998`) just in case.
+- **UI hint copy:** must be generic, e.g. *"Answer the math question shown above"* or *"Enter the result of the calculation"*. Do **NOT** show "Minimum 3 characters" — that was the original bug.
+- **FakeCourtClient parity:** the synthetic client currently serves text-style CAPTCHAs. This trains the team to expect the wrong format. Followup ticket: serve math CAPTCHAs in fake mode so dev-experience matches production.
+- **Test fixtures:** existing `captcha_text="ABCDE"` / `captcha_text="X"` in `test_fake_court_client.py` do not reflect real-world answers like `"22"`. Add a math-CAPTCHA fixture.
+
+**Hard commitment — load-bearing:** the human user solves the CAPTCHA. The arithmetic form is *trivially* solvable programmatically (regex + `eval`), but our [ADR-003](decisions/ADR-003.md) line holds: **no programmatic CAPTCHA solving in any code path, ever**. The CAPTCHA being arithmetic does not relax this — it is the principal-actor argument in Section E.2 that keeps us legally defensible, and it collapses the moment we automate the solve.
+
 ---
 
 ## Section D — Implementation implications for `DelhiHCClient`
@@ -262,14 +281,16 @@ Original report inferred Drupal at the app layer. **Wrong.** The stateful recon 
 
 This is **good news**. Laravel's XSRF mechanism is well-documented and `httpx`-compatible — see B.3 below.
 
+**Stack pattern confirmation (2026-05-17):** Laravel XSRF cookie → `X-XSRF-TOKEN` header → session cookie persistence across the 3-step flow **confirmed working in production** on 2026-05-17 against W.P.(C) 2344/2024 (founder's first `CLIENT_MODE=real` run). No Playwright pivot needed. Architecture decision [ADR-003](decisions/ADR-003.md) (httpx-only client) validated end-to-end.
+
 ### Per-unknown resolution map
 
 | B-row | Status after stateful recon | Evidence |
 |---|---|---|
 | **B.1 — cookies + headers + redirects** | **RESOLVED** | 2 cookies set on first GET: `XSRF-TOKEN` + `hc_application_session`. Both `domain=delhihighcourt.nic.in`, `path=/`, `Secure=true`, NOT HttpOnly (XSRF cookie must be JS-readable per Laravel pattern). Headers: `server: Apache`, `cache-control: no-cache, private`, `strict-transport-security: max-age=31536000; includeSubDomains; preload`, `x-frame-options: SAMEORIGIN`, `x-content-type-options: nosniff`. No redirects. |
-| **B.2 — form action URL + method** | **PARTIAL** | The form element is **JS-rendered** (0 `<form>` tags in static HTML; 148 `<option>` tags in a `<select>` ARE server-rendered). Inline JS references `https://delhihighcourt.nic.in/app/get-case-type-status` as both the page URL AND a POST endpoint. Plausibly the submit is a POST to the same URL with form-encoded body. **Confirming the exact body parameter names + content-type still needs a single human form submission with DevTools open.** |
+| **B.2 — form action URL + method** | **RESOLVED** | Field names confirmed via successful submit on **2026-05-17** against **W.P.(C) 2344/2024**. Field names locked: `case_type`, `case_number`, `case_year`, `captcha` (matches the body in `delhi_hc_client.py:247-252`). POST is form-encoded to `/app/get-case-type-status` with the `X-XSRF-TOKEN` header. **Action item:** Arjun to remove the `# TODO(B.2)` marker at `delhi_hc_client.py:246` and the `# TODO(B.2b)` marker at `delhi_hc_client.py:305-306` (the `/validateCaptcha` body shape `{"captcha": <text>}` was also exercised by the same successful submit). |
 | **B.3 — CSRF/state-token mechanism** | **RESOLVED — LARAVEL XSRF** | `XSRF-TOKEN` cookie set on GET, value is URL-encoded Laravel-encrypted JSON (`eyJpdiI6...` base64-style payload). **Mechanism**: client reads the cookie, URL-decodes it, sends back as `X-XSRF-TOKEN` request header on POSTs. This is Laravel's default XSRF middleware (`VerifyCsrfToken`). **`httpx`-compatible:** no JS execution required — `httpx.AsyncClient` with a cookie jar handles it natively, just need to mirror the cookie value into the header. **Implication: Playwright pivot NOT needed.** |
-| **B.4 — CAPTCHA URL + refresh + TTL** | **PARTIAL** | Discovered the CAPTCHA endpoints in inline JS: `GET /app/getCaptcha?<query>` (image bytes), `POST /app/generate-captcha` (rotates challenge), `POST /app/validateCaptcha` (separate pre-submit validation — see below). Audio fallback at `/app/storage/app/public/captcha_audios/`. **TTL still unknown** — needs the dev-with-browser to hold a session for 30/60/90/180s before submitting and observing the boundary at which the CAPTCHA token expires upstream. |
+| **B.4 — CAPTCHA URL + refresh + TTL** | **PARTIALLY RESOLVED** | Endpoints unchanged from prior recon (`GET /app/getCaptcha`, `POST /app/generate-captcha`, `POST /app/validateCaptcha`, audio fallback at `/app/storage/app/public/captcha_audios/`). **New (2026-05-17):** observed TTL **≥ 3 minutes**. UI countdown showed `~2:51` fresh on CAPTCHA receipt and the founder's submit succeeded within ~30s. Lower bound therefore ≥ 3 min (the 2:51 was already counting down from something close to 3:00). **Upper bound still unknown** — would need to deliberately wait > 3 min and re-submit to probe the upstream rejection boundary. **Implication for the placeholder:** the `NOTE(B.4)` block at `delhi_hc_client.py:302-304` says "TTL not yet enforced" — that comment is now stale. Action item for Arjun: either (a) update the comment to record the observed ≥3-min lower bound and decide whether to wire it to `CaptchaFetchResult.fetched_at_unix`, OR (b) **remove the NOTE entirely** since the code does not actually consume any TTL constant — no constant means nothing to mis-tune. Recommendation: **remove**, per the "don't design for hypothetical futures" principle. If the upper-bound probe ever runs and finds a hard TTL, add enforcement at that point. |
 | **B.5 — Case Type enum** | **RESOLVED** | **148 options** captured verbatim. First 10: `ADMIN.REPORT, ARB.A., ARB. A. (COMM.), ARB.P., BAIL APPLN., CA, CA (COMM.IPD-CR), C.A.(COMM.IPD-GI), C.A.(COMM.IPD-PAT), C.A.(COMM.IPD-PV)`. Last 10: `WP(C)(IPD), W.P.(CRL), WTA, WTC, WTR, ...` Full list in `scripts/dev/spike_recon_output.json` at `steps.5_case_type_enum.options_full`. Use this to seed `frontend/src/lib/case-types.ts` (currently has a hand-curated subset of ~5 entries). |
 | **B.6 — 20 anonymised result pages** | **NOT POSSIBLE WITHOUT A HUMAN** | Each result page only exists as a POST response to a form submission with a human-solved CAPTCHA. The orchestrator cannot solve CAPTCHAs (forbidden by [ADR-003](decisions/ADR-003.md)) and no other tool we have generates the result HTML. **This step strictly requires the dev to execute `SPIKE-PROTOCOL.md` §6 from a real browser.** |
 | **B.7 — rate-limit threshold** | **PARTIAL** | 3 sequential GETs of the form page at 3.1s spacing all returned HTTP 200 in 223-244ms. No degradation, no 429, no interstitial. Suggests the form-page-fetch path is generously rate-limited. **The submit endpoint was NOT probed** (would have required a CAPTCHA solve). Honest reading: at 1 request per 3 seconds we are comfortably below any rate-limit threshold the form-page path enforces. The submit-endpoint threshold is unknown until the dev probes it gently. |
@@ -305,13 +326,13 @@ The discovery of `/app/validateCaptcha` as a discrete endpoint is **the most con
 
 ### Residual unknowns (still need the dev with browser)
 
-| # | Unknown | Smallest experiment |
-|---|---|---|
-| 1 | Exact POST body params for `/app/get-case-type-status` | Open DevTools → Network tab → submit one real search → copy the request payload |
-| 2 | Whether `/app/validateCaptcha` is fired before submit, or only on refresh | Same DevTools session — watch the call order |
-| 3 | CAPTCHA TTL (upstream expiry) | Hold session for 30/60/90/180s before submit; record at what boundary it rejects |
-| 4 | 20 representative result HTML fixtures | Dev provides real case numbers, solves CAPTCHAs, captures responses, anonymises per `SPIKE-PROTOCOL.md` §6 PII rules |
-| 5 | Submit-endpoint rate-limit threshold | Gentle probe 0.5 → 2 req/s after fixture capture is done |
+| # | Unknown | Smallest experiment | Status |
+|---|---|---|---|
+| 1 | Exact POST body params for `/app/get-case-type-status` | Open DevTools → Network tab → submit one real search → copy the request payload | **RESOLVED 2026-05-17** — see B.2 row above |
+| 2 | Whether `/app/validateCaptcha` is fired before submit, or only on refresh | Same DevTools session — watch the call order | **RESOLVED 2026-05-17** — submit flow with `validate_before_submit=True` succeeded end-to-end against W.P.(C) 2344/2024 |
+| 3 | CAPTCHA TTL (upstream expiry) lower bound | Observe UI countdown on fresh CAPTCHA receipt | **PARTIAL** — lower bound ≥ 3 min observed. Upper bound still open (deliberate-wait probe deferred). |
+| 4 | 20 representative result HTML fixtures | Dev provides real case numbers, solves CAPTCHAs, captures responses, anonymises per `SPIKE-PROTOCOL.md` §6 PII rules | **OPEN** — Maya's bucket-1 investigation pending |
+| 5 | Submit-endpoint rate-limit threshold | Gentle probe 0.5 → 2 req/s after fixture capture is done | **OPEN** |
 
 ### Polite-client metrics from this recon
 
@@ -331,6 +352,26 @@ The discovery of `/app/validateCaptcha` as a discrete endpoint is **the most con
 ### Honest verdict
 
 **The good news is bigger than the bad news.** The CSRF mechanism turned out to be standard Laravel XSRF, which means `httpx`-only `DelhiHCClient` is viable — no Playwright budget needed. 7 of 10 B-row unknowns are now resolved without a browser session. The 3 residual unknowns (B.2 partial, B.4 partial, B.6 full) are exactly the ones the protocol was designed to close with a single dev in 2 days. The 2-day budget is intact and possibly conservative.
+
+**Update 2026-05-17 (post `CLIENT_MODE=real` first run):** B.2 is now fully RESOLVED and B.4 is PARTIALLY RESOLVED (≥3 min lower bound). Only B.6 (20 anonymised result fixtures) and the upper-bound CAPTCHA TTL probe remain. The end-to-end Laravel XSRF flow worked on the first real attempt against W.P.(C) 2344/2024 — pipeline succeeded, parser degraded (math CAPTCHA assumption mismatch caught in `CaptchaChallenge.tsx`, fixed live). See Section C.6 and the Real-world test log below.
+
+---
+
+## Section H — Real-world test log
+
+> Dated record of `CLIENT_MODE=real` runs against the live court site. Each row captures pipeline-vs-parser outcome separately so we can distinguish transport-layer health from extraction-quality regressions.
+
+| Date | Case | Outcome | Notes |
+|---|---|---|---|
+| 2026-05-17 | W.P.(C) 2344/2024 | Pipeline OK, parser failed | Math CAPTCHA observed (`19 + 3 =`), submit succeeded end-to-end via Laravel XSRF flow, `parser_degraded=true` because UI rejected the 2-digit answer `22` (`minLength=3` bug in `CaptchaChallenge.tsx` — fixed live; see `DEMO-FEEDBACK.md` #6). Confirms B.2 (POST body field names) and B.4 (CAPTCHA TTL ≥ 3 min). |
+| 2026-05-17 | W.P.(C) 6569/2023 (aircraft leasing — has judgment PDF) | Pipeline OK / parser status TBD | Maya's bucket-1 investigation pending. |
+| 2026-05-17 | W.P.(C) 10327/2023 (connected) | Pipeline OK / parser status TBD | Maya's bucket-1 investigation pending. |
+| 2026-05-17 | W.P.(C) 6626/2023 (connected) | Pipeline OK / parser status TBD | Maya's bucket-1 investigation pending. |
+
+**Conventions for future rows:**
+- *Pipeline* = init → fetch_captcha → submit reaches the parser without `CourtClientError` / `CourtBlockedError` / `CaptchaIncorrectError`.
+- *Parser* = `DHCParserV1` produces a `ParsedCase` with `parse_confidence ≥ 0.55` (the C.2 floor) and `parser_degraded=false`.
+- A row with "Pipeline OK, parser failed" is a B.6 (parser-quality gate G4) signal; a row with "Pipeline failed" is a B.1/B.2/B.3/B.4/B.7 signal.
 
 ---
 
