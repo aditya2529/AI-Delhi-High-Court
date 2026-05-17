@@ -90,6 +90,18 @@ export const STRINGS = {
     openCourt: "Open the official Delhi HC page",
     wrapperDisclaimer:
       "This is a third-party wrapper. The Delhi High Court's own site remains the authoritative source.",
+    // Dev-mode-only debugging affordances. NEVER rendered in production builds
+    // (see ErrorState — every dev field is gated on NODE_ENV !== "production").
+    devOnlyCaption: "DEV ONLY — not shown in production",
+    devCodeLabel: "code",
+    devHintLabel: "hint",
+    devRequestIdLabel: "request_id",
+    devRawMessageLabel: "raw message",
+    devHttpStatusLabel: "HTTP status",
+    devDetailsSummary: "Details (raw response)",
+    devCopy: "Copy",
+    devCopied: "Copied",
+    devCopyRequestIdAria: "Copy request_id to clipboard",
   },
 
   // Generic

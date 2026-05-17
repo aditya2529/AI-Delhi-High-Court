@@ -48,6 +48,11 @@ function url(path: string): string {
 /**
  * Typed error thrown for ANY non-2xx response or transport failure.
  * UI catches this and renders an ErrorState variant.
+ *
+ * `rawBody` preserves the response payload exactly as it came off the wire
+ * (the parsed JSON object when the response was JSON, otherwise the raw text
+ * string). It is consumed by ErrorState's dev-mode panel for debugging and
+ * MUST NOT be rendered in production builds.
  */
 export class ApiError extends Error {
   readonly code: ApiErrorCode | "network" | "unknown";
@@ -55,6 +60,7 @@ export class ApiError extends Error {
   readonly httpStatus: number;
   readonly hint?: string;
   readonly requestId?: string;
+  readonly rawBody?: unknown;
 
   constructor(args: {
     code: ApiErrorCode | "network" | "unknown";
@@ -63,6 +69,7 @@ export class ApiError extends Error {
     httpStatus: number;
     hint?: string;
     requestId?: string;
+    rawBody?: unknown;
   }) {
     super(args.message);
     this.name = "ApiError";
@@ -71,6 +78,7 @@ export class ApiError extends Error {
     this.httpStatus = args.httpStatus;
     this.hint = args.hint;
     this.requestId = args.requestId;
+    this.rawBody = args.rawBody;
   }
 }
 
@@ -87,15 +95,31 @@ function toApiError(err: unknown, fallbackStatus = 0): ApiError {
 }
 
 async function parseError(res: Response): Promise<ApiError> {
-  // Try to read the structured envelope; degrade gracefully if it isn't JSON.
-  let body: unknown = null;
+  // Read the body ONCE as text; we'll attempt a JSON parse afterwards. Reading
+  // text first means we can preserve the exact payload (HTML 500 pages, plain
+  // text errors, etc.) for the dev-mode ErrorState panel — `res.json()` would
+  // throw and lose the body.
+  let bodyText = "";
   try {
-    body = await res.json();
+    bodyText = await res.text();
   } catch {
-    // ignore — fall through to "unknown" below
+    // body already consumed or stream errored — leave bodyText empty
   }
 
-  const parsed = ApiErrorEnvelopeSchema.safeParse(body);
+  let bodyJson: unknown = null;
+  if (bodyText.length > 0) {
+    try {
+      bodyJson = JSON.parse(bodyText);
+    } catch {
+      // not JSON — bodyJson stays null, rawBody falls back to the text below
+    }
+  }
+
+  // Prefer the parsed JSON for rawBody when available; otherwise hand the raw
+  // text string through so devs can still inspect non-JSON 5xx responses.
+  const rawBody: unknown = bodyJson !== null ? bodyJson : bodyText || undefined;
+
+  const parsed = ApiErrorEnvelopeSchema.safeParse(bodyJson);
   if (parsed.success) {
     const e = parsed.data.error;
     return new ApiError({
@@ -106,6 +130,7 @@ async function parseError(res: Response): Promise<ApiError> {
       httpStatus: res.status,
       hint: e.hint,
       requestId: e.request_id,
+      rawBody,
     });
   }
 
@@ -115,6 +140,7 @@ async function parseError(res: Response): Promise<ApiError> {
     message: `Unexpected response (HTTP ${res.status}).`,
     retryable: res.status >= 500,
     httpStatus: res.status,
+    rawBody,
   });
 }
 

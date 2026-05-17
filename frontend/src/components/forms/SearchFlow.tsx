@@ -78,6 +78,14 @@ type FlowState =
       requestId?: string;
       courtSiteUrl?: string;
       values?: SearchFormValues;
+      // Dev-mode debugging metadata. Captured here so ErrorState can render
+      // the dev-only panel without a separate plumbing path. In production
+      // builds ErrorState ignores these — they are inert payload.
+      devErrorCode?: string;
+      devHint?: string;
+      devRawMessage?: string;
+      devHttpStatus?: number;
+      devRawBody?: unknown;
     };
 
 type FlowAction =
@@ -92,6 +100,7 @@ type FlowAction =
       values: SearchFormValues;
       variant: ErrorVariant;
       requestId?: string;
+      error?: ApiError;
     }
   | { type: "captcha/abort" }
   | {
@@ -174,6 +183,11 @@ function reducer(state: FlowState, action: FlowAction): FlowState {
         variant: action.variant,
         requestId: action.requestId,
         values: action.values,
+        devErrorCode: action.error?.code,
+        devHint: action.error?.hint,
+        devRawMessage: action.error?.message,
+        devHttpStatus: action.error?.httpStatus,
+        devRawBody: action.error?.rawBody,
       };
     }
 
@@ -233,6 +247,11 @@ function reducer(state: FlowState, action: FlowAction): FlowState {
         variant: mapApiErrorToVariant(action.error),
         requestId: action.error.requestId,
         values: action.values,
+        devErrorCode: action.error.code,
+        devHint: action.error.hint,
+        devRawMessage: action.error.message,
+        devHttpStatus: action.error.httpStatus,
+        devRawBody: action.error.rawBody,
       };
     }
 
@@ -283,6 +302,7 @@ export function SearchFlow() {
             values,
             variant: mapApiErrorToVariant(err),
             requestId: err.requestId,
+            error: err,
           });
         } else {
           dispatch({
@@ -387,6 +407,11 @@ export function SearchFlow() {
           courtSiteUrl={state.courtSiteUrl}
           onRetry={() => dispatch({ type: "error/retry" })}
           onStartOver={() => dispatch({ type: "error/start-over" })}
+          devErrorCode={state.devErrorCode}
+          devHint={state.devHint}
+          devRawMessage={state.devRawMessage}
+          devHttpStatus={state.devHttpStatus}
+          devRawBody={state.devRawBody}
         />
       );
 
