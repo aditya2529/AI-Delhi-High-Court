@@ -26,8 +26,8 @@ REAL-CLIENT DESIGN (post-spike, see docs/SPIKE-REPORT.md §G):
            jar per concurrent search (keyed by case tuple, then handed off to
            the SessionStore's CourtSession.cookies for submit).
   Flow: defaults to 3-step (validateCaptcha → submit). Set
-        `validate_before_submit=False` (or env DHC_TWO_STEP_SUBMIT=true) to
-        skip the explicit validate call if dev recon shows it's optional.
+        `validate_before_submit=False` on the constructor to skip the
+        explicit validate call if dev recon shows it's optional.
   Rate-limit: hardcoded ≥3s spacing between requests, process-global. One
               retry with exponential backoff on 5xx; no retry on 4xx.
   Safety: respects OUTBOUND_FETCH_ENABLED kill switch + DHC_HOSTNAME_ALLOWLIST
@@ -47,6 +47,7 @@ import httpx
 
 from app.clients.court_client import (
     CaptchaFetchResult,
+    CaptchaIncorrectError,
     CaseSearchResult,
     CourtBlockedError,
     CourtClient,
@@ -76,9 +77,10 @@ COOKIE_SESSION = "hc_application_session"
 # Polite-client pacing (per Arnav's recon §B.7 + STRATEGIES.md §2).
 MIN_REQUEST_SPACING_SECONDS = 3.0
 
-# CAPTCHA freshness placeholder. Real value to be confirmed by dev-with-browser.
-# TODO(B.4): confirm CAPTCHA TTL boundary — using 60s placeholder
-CAPTCHA_TTL_SECONDS_PLACEHOLDER = 60
+# Retry policy for 5xx transport failures. One retry total, then surface
+# the failure to the caller. 4xx is never retried — it's a contract error.
+MAX_RETRY_ATTEMPTS = 1
+RETRY_BACKOFF_BASE_SECONDS = 1.5
 
 
 @dataclass
@@ -140,10 +142,13 @@ class DelhiHCClient(CourtClient):
         """
         self._settings = settings or get_settings()
         self._validate_before_submit = validate_before_submit
+        # NOTE: see Raj review — bridge is sequential-single-user only;
+        # concurrency fix deferred to next sprint pending ABC adjustment.
         self._pending: dict[str, _PendingSession] = {}
         self._last_request_at: float = 0.0
         self._pacing_lock = asyncio.Lock()
         self._robots_parser: Optional[urllib.robotparser.RobotFileParser] = None
+        self._robots_loaded: bool = False
         self._robots_fetched_at: float = 0.0
         self._client = httpx.AsyncClient(
             base_url=self._settings.dhc_base_url,
@@ -265,12 +270,13 @@ class DelhiHCClient(CourtClient):
     async def is_path_allowed_by_robots(self, *, path: str) -> bool:
         """Check robots.txt as a kill switch.
 
-        Recon found /robots.txt returns 404, which under our compliance
-        policy means "no rules → access permitted." We still fetch each
-        startup (and cache) so a future robots.txt is honoured the moment
-        the court publishes one.
+        Recon found /robots.txt returns 404 → "no rules → permitted."
+        We fetch once per process (the ``_robots_loaded`` flag flips on
+        success OR 404), so a 404 cannot trigger a re-fetch storm. A
+        process restart is required to pick up a future robots.txt —
+        the right cadence for a kill-switch input.
         """
-        if self._robots_parser is None:
+        if not self._robots_loaded:
             await self._load_robots()
         parser = self._robots_parser
         if parser is None:
@@ -289,19 +295,27 @@ class DelhiHCClient(CourtClient):
     ) -> None:
         """POST the pre-submit captcha validation. Raises on rejection.
 
-        Body field name reuses the placeholder from submit_search (see the
-        B.2 TODO there) — both endpoints accept the captcha field under the
-        same key per the rendered form structure.
+        4xx → `CaptchaIncorrectError` (route maps to a 200 captcha_failed,
+        NOT a 503 court_error). 5xx → `CourtClientError` (transport).
+
+        NOTE(B.4): CAPTCHA TTL not yet enforced; dev recon will reveal
+        whether upstream enforces a TTL window. If yes, wire to
+        CaptchaFetchResult.fetched_at_unix here.
         """
+        # TODO(B.2b): confirm /validateCaptcha body shape — using
+        # {"captcha": text} as placeholder
         body = {"captcha": captcha_text}
         resp = await self._post_form(
-            ENDPOINT_VALIDATE_CAPTCHA, body=body, cookies=cookies, xsrf=xsrf,
+            ENDPOINT_VALIDATE_CAPTCHA, body=body,
+            cookies=cookies, xsrf=xsrf, raise_on_4xx=False,
         )
-        # Upstream returns JSON {status: bool} per recon — be lenient about
-        # exact shape until confirmed in B.2; non-2xx is treated as failure.
-        if resp.status_code >= 400:
+        if 400 <= resp.status_code < 500:
+            raise CaptchaIncorrectError(
+                f"validateCaptcha rejected captcha: status={resp.status_code}"
+            )
+        if resp.status_code >= 500:
             raise CourtClientError(
-                f"validateCaptcha rejected: status={resp.status_code}"
+                f"validateCaptcha upstream error: status={resp.status_code}"
             )
 
     async def _post_form(
@@ -311,8 +325,14 @@ class DelhiHCClient(CourtClient):
         body: dict[str, str],
         cookies: dict[str, str],
         xsrf: str,
+        raise_on_4xx: bool = True,
     ) -> httpx.Response:
-        """POST a form-encoded body with XSRF + cookies wired."""
+        """POST a form-encoded body with XSRF + cookies wired.
+
+        ``raise_on_4xx=False`` lets the caller translate 4xx into a typed
+        exception (e.g. ``CaptchaIncorrectError``) instead of the generic
+        transport error.
+        """
         headers = {
             "X-XSRF-TOKEN": xsrf,
             "Referer": str(self._client.base_url.join(ENDPOINT_FORM_PAGE)),
@@ -320,6 +340,7 @@ class DelhiHCClient(CourtClient):
         }
         return await self._request(
             "POST", path, data=body, headers=headers, cookies=cookies,
+            raise_on_4xx=raise_on_4xx,
         )
 
     async def _request(
@@ -331,8 +352,13 @@ class DelhiHCClient(CourtClient):
         data: Optional[dict[str, str]] = None,
         headers: Optional[dict[str, str]] = None,
         cookies: Optional[dict[str, str]] = None,
+        raise_on_4xx: bool = True,
     ) -> httpx.Response:
-        """Single chokepoint: pacing + SSRF guard + retry + send."""
+        """Single chokepoint: pacing + SSRF guard + retry + send.
+
+        ``raise_on_4xx=False`` lets the caller translate a 4xx into a
+        typed exception (e.g. ``CaptchaIncorrectError``).
+        """
         full_url = str(self._client.base_url.join(path))
         self._guard_hostname_allowed(full_url)
         await self._respect_min_spacing()
@@ -351,7 +377,7 @@ class DelhiHCClient(CourtClient):
             )
         except httpx.HTTPError as exc:
             raise CourtClientError(f"Transport error on {method} {path}: {exc}") from exc
-        if 400 <= resp.status_code < 500:
+        if raise_on_4xx and 400 <= resp.status_code < 500:
             raise CourtClientError(
                 f"{method} {path} returned {resp.status_code}"
             )
@@ -366,14 +392,19 @@ class DelhiHCClient(CourtClient):
         data: Optional[dict[str, str]],
         headers: Optional[dict[str, str]],
     ) -> httpx.Response:
-        """Send the request; one retry with exp backoff on 5xx."""
-        for attempt in (1, 2):
+        """Send the request; retry on 5xx up to MAX_RETRY_ATTEMPTS times.
+
+        Total send count is ``1 + MAX_RETRY_ATTEMPTS``. 4xx is NEVER
+        retried — it's a contract error, not a transport blip.
+        """
+        max_sends = MAX_RETRY_ATTEMPTS + 1
+        for attempt in range(1, max_sends + 1):
             resp = await self._client.request(
                 method, path, params=params, data=data, headers=headers,
             )
-            if resp.status_code < 500 or attempt == 2:
+            if resp.status_code < 500 or attempt == max_sends:
                 return resp
-            backoff = 1.5 * attempt
+            backoff = RETRY_BACKOFF_BASE_SECONDS * attempt
             log.warning(
                 "dhc.upstream.5xx_retry",
                 method=method, path=path, status=resp.status_code,
@@ -392,20 +423,28 @@ class DelhiHCClient(CourtClient):
             self._last_request_at = time.time()
 
     async def _load_robots(self) -> None:
-        """One-shot fetch of /robots.txt; cache the parsed result."""
+        """One-shot fetch of /robots.txt; cache the parsed result.
+
+        Always flips ``_robots_loaded=True`` (success, 404, or transport
+        error) so subsequent calls skip the network — prevents the
+        "permissive-on-404 → re-fetch every call" storm Raj flagged.
+        """
         try:
             resp = await self._client.get("/robots.txt")
         except httpx.HTTPError as exc:
             log.warning("dhc.robots.fetch_failed", error=str(exc))
             self._robots_parser = None
+            self._robots_loaded = True
             return
         if resp.status_code == 404:
             self._robots_parser = None  # permissive
+            self._robots_loaded = True
             return
         parser = urllib.robotparser.RobotFileParser()
         parser.parse(resp.text.splitlines())
         self._robots_parser = parser
         self._robots_fetched_at = time.time()
+        self._robots_loaded = True
 
     def _cookies_for(self, session: CourtSession) -> tuple[dict[str, str], str]:
         """Resolve the cookie jar + XSRF token to use for a request.

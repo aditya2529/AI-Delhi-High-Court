@@ -26,7 +26,9 @@ import httpx
 import pytest
 
 from app.clients.court_client import (
+    CaptchaIncorrectError,
     CourtBlockedError,
+    CourtClientError,
     OutboundDisabledError,
 )
 from app.clients.delhi_hc_client import (
@@ -47,6 +49,25 @@ from app.sessions.store import CourtSession
 RAW_XSRF = "eyJpdiI6Imh5akh2blNPRjBSN2xuYWZyVHpvMkE9PSIsInZhbHVlIjoicGViNnFjMjYwa0tYSkQybUtNS1FXTVVmZWQzdGR0Ky9qaUczNFBaYU1icFFhWnlYNHdxWi83d2lMTGN4TnZaQ3N3THZNT3RZTlNOUStYYzdacXBydUtmOHcrRnEzMFgvVGRINHNoSTRqd2JKRE9GQkFsNU91ZjJZeThiL3VobnkiLCJtYWMiOiJmZDhlNGJjZDE3OTQ1NDM4Nzk4NTNjZDVmMjMyMGQ1ODg4OTM1MmYzNjA0MzBmYjZlYzQwMDE2MWQ4ZjNmZmIxIiwidGFnIjoiIn0%3D"
 RAW_SESSION = "eyJpdiI6IkxqdThpeXo1eW1hUG5qcTJ5TWE4Qnc9PSIsInZhbHVlIjoiUFJPdnkya2IxdHdTbktuWU5qUFI0dkxTRElGSTFHZXFmbGlaOHNvVjhUYUswQnk5dWVTQ3VKcEQwc2Q5dk9ySk9LZVRWUDZQVVBNOUtUOUFzK3k5L2dZSHRmK0k1dnhxVWlMZ2dKdldQS0t5MGFHOHZtT04va0d3WTZFYlk5VFIiLCJtYWMiOiJhYzkxMjA2NTYwNmFhYjU1NDY1YzkxOTcwZTYwMWM1NzFkMjZhNzNkYTUzZTlhOTY2ZjIyNmQzYmE3MTY4YjNlIiwidGFnIjoiIn0%3D"
 DECODED_XSRF = urllib.parse.unquote(RAW_XSRF)
+
+
+@pytest.fixture(autouse=True)
+def _reset_caches_and_flags():
+    """Reset module-level caches and runtime flags before AND after every
+    test in this file so order-of-execution can never leak state.
+
+    `get_settings` is an ``lru_cache``-wrapped factory — clear it both
+    sides. `get_flags` is NOT cached (returns a module singleton); we
+    instead reset the live ``outbound_fetch_enabled`` attribute to the
+    test-env value so kill-switch tests can't leak a False into the next
+    test. Removes the ordering risk Raj flagged.
+    """
+    def _reset() -> None:
+        get_settings.cache_clear()
+        get_flags().outbound_fetch_enabled = True
+    _reset()
+    yield
+    _reset()
 
 
 @pytest.fixture(autouse=True)
@@ -339,3 +360,247 @@ class TestHostnameAllowlist:
         finally:
             await client.aclose()
         assert recorded == [], "SSRF guard must fire before any wire activity"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Retry + error-mapping tests (Raj review: M3 + M4)
+# ────────────────────────────────────────────────────────────────────────
+
+
+def _make_init_then_captcha_handler(
+    captured: list[httpx.Request],
+    validate_captcha_response: httpx.Response,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Handler that lets init + captcha + validate succeed up to the validate
+    step, then returns the caller-supplied response for /validateCaptcha.
+
+    Used by the CaptchaIncorrectError regression test: we need a full
+    init → captcha → validate path so submit_search reaches the validate
+    call we want to assert on.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        path = request.url.path
+        if request.method == "GET" and path == ENDPOINT_FORM_PAGE:
+            return _form_page_response_with_cookies()
+        if request.method == "GET" and path == ENDPOINT_GET_CAPTCHA:
+            return httpx.Response(
+                200,
+                content=b"\x89PNG\r\n\x1a\nFAKE",
+                headers={"content-type": "image/png"},
+            )
+        if request.method == "POST" and path == ENDPOINT_VALIDATE_CAPTCHA:
+            return validate_captcha_response
+        if request.method == "POST" and path == ENDPOINT_SUBMIT:
+            # Should not be reached when validate returns non-2xx.
+            return httpx.Response(200, text="<html>unexpected submit</html>")
+        if request.method == "GET" and path == "/robots.txt":
+            return httpx.Response(404, text="")
+        raise AssertionError(f"unexpected request: {request.method} {path}")
+    return handler
+
+
+class TestValidateCaptcha4xxMapping:
+    """M3: validateCaptcha 4xx must surface as CaptchaIncorrectError so the
+    route layer maps it to a 200 captcha_failed response, NOT a 503
+    court_error.
+    """
+
+    async def test_4xx_from_validate_captcha_raises_captcha_incorrect(self):
+        """A 422 from /validateCaptcha → CaptchaIncorrectError on submit_search."""
+        recorded: list[httpx.Request] = []
+        handler = _make_init_then_captcha_handler(
+            recorded,
+            validate_captcha_response=httpx.Response(
+                422, json={"status": False, "message": "captcha invalid"},
+            ),
+        )
+        client, _ = _mk_client(
+            validate_before_submit=True, handler=handler, captured=recorded,
+        )
+        try:
+            await client.init_session(
+                case_type="W.P.(C)", case_number="1", year=2024,
+            )
+            session = CourtSession(
+                session_id="sid", case_type="W.P.(C)",
+                case_number="1", year=2024,
+            )
+            await client.fetch_captcha(session=session)
+            with pytest.raises(CaptchaIncorrectError):
+                await client.submit_search(session=session, captcha_text="WRONG")
+        finally:
+            await client.aclose()
+        # Final submit must NOT have been attempted.
+        submit_calls = [
+            r for r in recorded
+            if r.method == "POST" and r.url.path == ENDPOINT_SUBMIT
+        ]
+        assert submit_calls == [], (
+            "submit must be skipped when validateCaptcha rejects the captcha"
+        )
+
+    async def test_5xx_from_validate_captcha_raises_court_client_error(self):
+        """A 503 from /validateCaptcha → generic CourtClientError (transport)."""
+        recorded: list[httpx.Request] = []
+        handler = _make_init_then_captcha_handler(
+            recorded,
+            validate_captcha_response=httpx.Response(503, text="upstream down"),
+        )
+        client, _ = _mk_client(
+            validate_before_submit=True, handler=handler, captured=recorded,
+        )
+        try:
+            await client.init_session(
+                case_type="W.P.(C)", case_number="1", year=2024,
+            )
+            session = CourtSession(
+                session_id="sid", case_type="W.P.(C)",
+                case_number="1", year=2024,
+            )
+            await client.fetch_captcha(session=session)
+            with pytest.raises(CourtClientError) as excinfo:
+                await client.submit_search(session=session, captcha_text="X")
+            assert not isinstance(excinfo.value, CaptchaIncorrectError), (
+                "5xx must NOT be miscategorised as a captcha-incorrect error"
+            )
+        finally:
+            await client.aclose()
+
+
+# ────────────────────────────────────────────────────────────────────────
+# M4: retry-behaviour tests for _send_with_retry. Counting handlers +
+# patched asyncio.sleep keep the suite fast and deterministic.
+# ────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def _no_sleep(monkeypatch):
+    """Patch asyncio.sleep inside the client module so the retry-backoff
+    doesn't add seconds to the test wall clock."""
+    from app.clients import delhi_hc_client as mod
+
+    async def _instant(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(mod.asyncio, "sleep", _instant)
+
+
+def _counting_handler(
+    *,
+    responses: list[httpx.Response],
+    path_to_count: str,
+    counter: dict[str, int],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Return canned responses in order for `path_to_count`; serve the
+    side paths (robots only) with bland defaults.
+
+    The counted path is checked FIRST — these retry tests deliberately
+    point `path_to_count` at endpoints the main test flow would normally
+    serve themselves, so the count-and-return branch must win.
+
+    Counter dict (passed in by ref) records how many times path_to_count
+    was hit — that's the assertion subject for the retry tests.
+    """
+    idx = {"i": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == path_to_count:
+            counter["n"] += 1
+            i = idx["i"]
+            idx["i"] = min(i + 1, len(responses) - 1)
+            return responses[i]
+        if request.method == "GET" and path == "/robots.txt":
+            return httpx.Response(404, text="")
+        raise AssertionError(f"unexpected request: {request.method} {path}")
+
+    return handler
+
+
+class TestSendWithRetry:
+    """M4: pin the retry policy in code so future drift fails loudly.
+
+    Policy (MAX_RETRY_ATTEMPTS=1):
+      - 4xx → return immediately, NO retry. Caller sees CourtClientError.
+      - 5xx → 200 → retry once, success. Handler hit exactly twice.
+      - 5xx → 5xx → one retry, then surface failure. Handler hit twice.
+    """
+
+    async def test_4xx_does_not_retry_and_raises_court_client_error(
+        self, _no_sleep,
+    ):
+        """A single 404 from the form page → CourtClientError, ONE call."""
+        counter = {"n": 0}
+        handler = _counting_handler(
+            responses=[httpx.Response(404, text="not found")],
+            path_to_count=ENDPOINT_FORM_PAGE,
+            counter=counter,
+        )
+        # We can't reuse _mk_client here because _counting_handler owns
+        # ENDPOINT_FORM_PAGE — build the client inline with the handler.
+        get_settings.cache_clear()
+        client = DelhiHCClient(transport=httpx.MockTransport(handler))
+        try:
+            with pytest.raises(CourtClientError):
+                await client.init_session(
+                    case_type="W.P.(C)", case_number="1", year=2024,
+                )
+        finally:
+            await client.aclose()
+        assert counter["n"] == 1, (
+            "4xx must NOT be retried — observed %d calls" % counter["n"]
+        )
+
+    async def test_5xx_then_200_retries_once_and_succeeds(self, _no_sleep):
+        """5xx → 200 sequence: caller sees success, handler hit TWICE."""
+        counter = {"n": 0}
+        handler = _counting_handler(
+            responses=[
+                httpx.Response(503, text="transient"),
+                _form_page_response_with_cookies(),
+            ],
+            path_to_count=ENDPOINT_FORM_PAGE,
+            counter=counter,
+        )
+        get_settings.cache_clear()
+        client = DelhiHCClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await client.init_session(
+                case_type="W.P.(C)", case_number="1", year=2024,
+            )
+        finally:
+            await client.aclose()
+        assert counter["n"] == 2, (
+            "expected 1 retry on 5xx — observed %d calls" % counter["n"]
+        )
+        assert result[COOKIE_XSRF] == RAW_XSRF, "post-retry response must be used"
+
+    async def test_5xx_then_5xx_retries_once_then_raises(self, _no_sleep):
+        """5xx → 5xx: ONE retry only (not three), caller sees CourtClientError."""
+        counter = {"n": 0}
+        handler = _counting_handler(
+            responses=[
+                httpx.Response(503, text="down"),
+                httpx.Response(502, text="still down"),
+            ],
+            path_to_count=ENDPOINT_FORM_PAGE,
+            counter=counter,
+        )
+        get_settings.cache_clear()
+        client = DelhiHCClient(transport=httpx.MockTransport(handler))
+        try:
+            # 5xx from init_session falls through _request (which only
+            # raises on 4xx by default) into init_session's xsrf check,
+            # which then raises CourtClientError because no XSRF cookie
+            # was set. Either way, the caller sees CourtClientError.
+            with pytest.raises(CourtClientError):
+                await client.init_session(
+                    case_type="W.P.(C)", case_number="1", year=2024,
+                )
+        finally:
+            await client.aclose()
+        assert counter["n"] == 2, (
+            "MAX_RETRY_ATTEMPTS=1 → exactly 2 sends (1 + 1 retry); "
+            "observed %d" % counter["n"]
+        )
