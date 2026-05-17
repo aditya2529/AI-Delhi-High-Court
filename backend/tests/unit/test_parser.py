@@ -287,6 +287,106 @@ class TestConfidenceFloorWiring:
             "the scoring regressed and fresh cases are being hidden."
         )
 
+    def test_confidence_exactly_at_floor_is_not_degraded(self):
+        """BOUNDARY: synthetic page that scores EXACTLY 0.55. parser_degraded
+        must be False — this proves the comparison in `parse_with_outcome`
+        is strict ``<`` and not ``<=``. If someone flips it to ``<=``, this
+        test fails and the regression is caught before merge.
+
+        Shape: parties (base 0.40) + status (+0.10) + last_hearing (+0.05)
+        = 0.55 exactly. Scoring is exact (not floating-point approximate)
+        because the rubric only emits {0.05, 0.10, 0.25} increments and
+        the result is rounded to 2 dp in ``_compute_confidence``.
+        """
+        at_floor_html = """
+        <html><body><div class="container">
+          <table class="case-details">
+            <tr><th>Status</th><td class="case-status">PENDING</td></tr>
+            <tr><th>Last Hearing</th><td class="last-hearing-date">2026-04-01</td></tr>
+          </table>
+          <table class="parties">
+            <tr class="party petitioner">
+              <td class="role">Petitioner</td>
+              <td class="name">ACME LTD</td>
+            </tr>
+            <tr class="party respondent">
+              <td class="role">Respondent</td>
+              <td class="name">STATE OF X</td>
+            </tr>
+          </table>
+        </div></body></html>
+        """
+        parser = DHCParserV1()
+        outcome = parser.parse_with_outcome(
+            at_floor_html,
+            source_url="https://delhihighcourt.nic.in/x",
+            case_type="W.P.(C)", case_number="1", year=2024,
+        )
+        assert outcome.case is not None
+        # The score must land EXACTLY at the floor — proves we're testing
+        # the boundary, not just a value above it.
+        assert outcome.case.parse_confidence == PARSER_CONFIDENCE_FLOOR, (
+            f"Expected exactly {PARSER_CONFIDENCE_FLOOR} (rubric quantises "
+            f"to 0.05 steps); got {outcome.case.parse_confidence}. If the "
+            f"scoring rubric in _compute_confidence has been retuned, "
+            f"reconstruct the at-floor synthetic page to hit the new floor."
+        )
+        # And the comparison must be strict ``<`` so that *at* the floor is
+        # treated as NOT degraded.
+        assert outcome.parser_degraded is False, (
+            "At PARSER_CONFIDENCE_FLOOR exactly, parser_degraded MUST be False. "
+            "If this fails, the floor comparison in parse_with_outcome likely "
+            "regressed from ``<`` to ``<=`` — that would hide every fresh "
+            "filing that sits precisely at the floor."
+        )
+
+    def test_confidence_just_below_floor_is_degraded(self):
+        """BOUNDARY: the smallest representable step below the floor. Given
+        the rubric quantises to 0.05 increments ({0.05, 0.10, 0.25}) and
+        rounds to 2 dp, the nearest representable value below 0.55 is 0.50
+        — there is no representable score in (0.50, 0.55). We assert at
+        0.50 with a comment so future readers know why we don't probe
+        0.5499 directly.
+
+        Shape: parties (base 0.40) + status (+0.10) = 0.50. 0.50 < 0.55
+        → degraded. Pair with the exactly-at-floor test above to pin both
+        sides of the strict-``<`` inequality.
+        """
+        below_floor_html = """
+        <html><body><div class="container">
+          <table class="case-details">
+            <tr><th>Status</th><td class="case-status">PENDING</td></tr>
+          </table>
+          <table class="parties">
+            <tr class="party petitioner">
+              <td class="role">Petitioner</td>
+              <td class="name">ACME LTD</td>
+            </tr>
+            <tr class="party respondent">
+              <td class="role">Respondent</td>
+              <td class="name">STATE OF X</td>
+            </tr>
+          </table>
+        </div></body></html>
+        """
+        parser = DHCParserV1()
+        outcome = parser.parse_with_outcome(
+            below_floor_html,
+            source_url="https://delhihighcourt.nic.in/x",
+            case_type="W.P.(C)", case_number="1", year=2024,
+        )
+        assert outcome.case is not None
+        # Exact value: 0.50 is the smallest representable score below 0.55
+        # under the current 0.05-step rubric. If the rubric is retuned to
+        # finer granularity (e.g. 0.01), tighten this to 0.5499.
+        assert outcome.case.parse_confidence == 0.50
+        assert outcome.case.parse_confidence < PARSER_CONFIDENCE_FLOOR
+        assert outcome.parser_degraded is True, (
+            "0.50 is below the 0.55 floor; parser_degraded MUST be True. "
+            "If this fails, either the floor was lowered or the comparison "
+            "direction inverted — both would silently render unreliable data."
+        )
+
     def test_subfloor_synthetic_page_flips_parser_degraded(self):
         """Adversarial: build a synthetic page that extracts cleanly but
         scores BELOW the floor. parser_degraded must be True so the UI

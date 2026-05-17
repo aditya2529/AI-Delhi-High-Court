@@ -16,6 +16,12 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["tests/**/*.test.{ts,tsx}"],
+    // Pick up both the central `tests/` suite AND tests colocated next to
+    // the module they cover under `src/`. Colocation is allowed for pure
+    // logic tests (no rendering) — e.g. `src/lib/case-types.test.ts`.
+    include: [
+      "tests/**/*.test.{ts,tsx}",
+      "src/**/*.test.{ts,tsx}",
+    ],
   },
 });
