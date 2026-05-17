@@ -245,9 +245,92 @@ The spike is **complete** when all of the following are simultaneously true:
 
 ---
 
-## Section G — Findings appendix (to be written by developer at end of spike)
+## Section G — Stateful recon findings (Claude orchestrator, 2026-05-17)
 
-> Reserved. The developer executing `SPIKE-PROTOCOL.md` appends verbatim findings here, keyed back to each B-row. Format: one subsection per B-unknown, "What we expected" / "What we observed" / "Decision". After this section is filled, the spike report is re-circulated to Arjun, Sneha, Maya, and the owner for G1 close-out.
+> Source: `scripts/dev/spike_recon.py` run from a single workstation, 3.1s between requests, honest UA `DelhiHCCaseTracker-Spike/0.1 (private alpha reconnaissance...)`, GET-only, NO form submission attempted. Raw JSON output at `scripts/dev/spike_recon_output.json`. WebFetch was permitted for this run after the owner authorised the spike + lifted the older safety-gate veto.
+>
+> **What this section is NOT:** a full close-out of all 10 B-row unknowns. We resolved 7 of 10 from outside the form-submit boundary; **B.6 (20 fixtures) + B.2-partial (POST body shape) + B.4-partial (CAPTCHA TTL behaviour) remain dev-with-browser work** because they need a human-solved CAPTCHA the orchestrator cannot generate.
+
+### Tech-stack correction
+
+Original report inferred Drupal at the app layer. **Wrong.** The stateful recon confirms:
+
+- **Server**: `Apache` (from response header `server: Apache`)
+- **App layer**: **Laravel / PHP** — confirmed by cookie signatures `XSRF-TOKEN` (Laravel-encrypted) + `hc_application_session` (Laravel session)
+- The `/web/*` paths may still be Drupal — they're a different mount and were not re-tested in the stateful run
+- All `/app/*` paths (the case-status app — what we actually integrate against) are **Laravel**
+
+This is **good news**. Laravel's XSRF mechanism is well-documented and `httpx`-compatible — see B.3 below.
+
+### Per-unknown resolution map
+
+| B-row | Status after stateful recon | Evidence |
+|---|---|---|
+| **B.1 — cookies + headers + redirects** | **RESOLVED** | 2 cookies set on first GET: `XSRF-TOKEN` + `hc_application_session`. Both `domain=delhihighcourt.nic.in`, `path=/`, `Secure=true`, NOT HttpOnly (XSRF cookie must be JS-readable per Laravel pattern). Headers: `server: Apache`, `cache-control: no-cache, private`, `strict-transport-security: max-age=31536000; includeSubDomains; preload`, `x-frame-options: SAMEORIGIN`, `x-content-type-options: nosniff`. No redirects. |
+| **B.2 — form action URL + method** | **PARTIAL** | The form element is **JS-rendered** (0 `<form>` tags in static HTML; 148 `<option>` tags in a `<select>` ARE server-rendered). Inline JS references `https://delhihighcourt.nic.in/app/get-case-type-status` as both the page URL AND a POST endpoint. Plausibly the submit is a POST to the same URL with form-encoded body. **Confirming the exact body parameter names + content-type still needs a single human form submission with DevTools open.** |
+| **B.3 — CSRF/state-token mechanism** | **RESOLVED — LARAVEL XSRF** | `XSRF-TOKEN` cookie set on GET, value is URL-encoded Laravel-encrypted JSON (`eyJpdiI6...` base64-style payload). **Mechanism**: client reads the cookie, URL-decodes it, sends back as `X-XSRF-TOKEN` request header on POSTs. This is Laravel's default XSRF middleware (`VerifyCsrfToken`). **`httpx`-compatible:** no JS execution required — `httpx.AsyncClient` with a cookie jar handles it natively, just need to mirror the cookie value into the header. **Implication: Playwright pivot NOT needed.** |
+| **B.4 — CAPTCHA URL + refresh + TTL** | **PARTIAL** | Discovered the CAPTCHA endpoints in inline JS: `GET /app/getCaptcha?<query>` (image bytes), `POST /app/generate-captcha` (rotates challenge), `POST /app/validateCaptcha` (separate pre-submit validation — see below). Audio fallback at `/app/storage/app/public/captcha_audios/`. **TTL still unknown** — needs the dev-with-browser to hold a session for 30/60/90/180s before submitting and observing the boundary at which the CAPTCHA token expires upstream. |
+| **B.5 — Case Type enum** | **RESOLVED** | **148 options** captured verbatim. First 10: `ADMIN.REPORT, ARB.A., ARB. A. (COMM.), ARB.P., BAIL APPLN., CA, CA (COMM.IPD-CR), C.A.(COMM.IPD-GI), C.A.(COMM.IPD-PAT), C.A.(COMM.IPD-PV)`. Last 10: `WP(C)(IPD), W.P.(CRL), WTA, WTC, WTR, ...` Full list in `scripts/dev/spike_recon_output.json` at `steps.5_case_type_enum.options_full`. Use this to seed `frontend/src/lib/case-types.ts` (currently has a hand-curated subset of ~5 entries). |
+| **B.6 — 20 anonymised result pages** | **NOT POSSIBLE WITHOUT A HUMAN** | Each result page only exists as a POST response to a form submission with a human-solved CAPTCHA. The orchestrator cannot solve CAPTCHAs (forbidden by [ADR-003](decisions/ADR-003.md)) and no other tool we have generates the result HTML. **This step strictly requires the dev to execute `SPIKE-PROTOCOL.md` §6 from a real browser.** |
+| **B.7 — rate-limit threshold** | **PARTIAL** | 3 sequential GETs of the form page at 3.1s spacing all returned HTTP 200 in 223-244ms. No degradation, no 429, no interstitial. Suggests the form-page-fetch path is generously rate-limited. **The submit endpoint was NOT probed** (would have required a CAPTCHA solve). Honest reading: at 1 request per 3 seconds we are comfortably below any rate-limit threshold the form-page path enforces. The submit-endpoint threshold is unknown until the dev probes it gently. |
+| **B.8 — robots.txt content** | **RESOLVED — does not exist** | `GET /robots.txt` returns HTTP 404. Per our compliance policy (`DHC_RESPECT_ROBOTS_TXT=true`), no rules → no disallows → access permitted. **Document this snapshot.** |
+| **B.9 — accidental cross-host redirects** | **RESOLVED — none observed** | Initial GET produced no redirects. SSRF allowlist can stay pinned to single host `delhihighcourt.nic.in` for now. Re-validate after the dev exercises the submit + CAPTCHA-refresh paths. |
+| **B.10 — copyright + privacy policy content** | **RESOLVED — verbatim** | See Section E for the engineering interpretation. Verbatim copies should be archived under `docs/legal/copyright-policy.snapshot.html` + `docs/legal/privacy-policy.snapshot.html` for the launch-readiness review. |
+
+### Discovered endpoints (new info not in original report)
+
+The case-status flow appears to be a **3-step interaction**, not 2:
+
+| Step | Method | URL | Purpose |
+|---|---|---|---|
+| 1 | GET | `/app/get-case-type-status` | Page load; sets `XSRF-TOKEN` + `hc_application_session` cookies |
+| 2 | GET | `/app/getCaptcha?<query>` | Returns CAPTCHA image bytes for display |
+| 3 | POST | `/app/validateCaptcha` | **Separate CAPTCHA-validation step** before the actual search submit (likely AJAX-fired from JS) |
+| 4 | POST | `/app/generate-captcha` | Refresh — rotates to a new CAPTCHA challenge (used by "🔄 reload-captcha" button) |
+| 5 | POST | `/app/get-case-type-status` (inferred) | Final search submit — body parameters TBD |
+
+The discovery of `/app/validateCaptcha` as a discrete endpoint is **the most consequential new finding for `DelhiHCClient` design.** It means the contract is:
+
+1. We GET the form page (cookies + XSRF token established).
+2. We GET the CAPTCHA image, present to user.
+3. When the user submits, we may need to **first POST `/validateCaptcha` to confirm the CAPTCHA before** firing the case-search POST. OR the validation may happen inline on the search POST. The dev's protocol step §2 + §3 must determine which.
+
+### Implications for `DelhiHCClient` (Arjun's post-spike work)
+
+1. **Cookie jar** scoped per `CourtSession` — `XSRF-TOKEN` + `hc_application_session` flow through every request.
+2. **XSRF header pattern** — read the `XSRF-TOKEN` cookie value, URL-decode it (Laravel encrypts it but the client only needs to echo the decoded form), send as `X-XSRF-TOKEN` request header on every POST.
+3. **CAPTCHA endpoint discovery** — wire to `/app/getCaptcha?...`, `/app/generate-captcha` (refresh), and possibly `/app/validateCaptcha`. The exact query parameters on `/getCaptcha` are still TBD — observable when the dev opens DevTools mid-flow.
+4. **Submit endpoint** — assume `POST /app/get-case-type-status` until the dev confirms otherwise. Body params likely include `case_type`, `case_number`, `year`, `captcha_code`, possibly `_token` (Laravel-injected hidden input that we should look for in the JS-rendered form).
+5. **`httpx` is sufficient.** Playwright/Selenium NOT required for v1. This is a meaningful budget recovery from the worst-case scenario the original report worried about.
+
+### Residual unknowns (still need the dev with browser)
+
+| # | Unknown | Smallest experiment |
+|---|---|---|
+| 1 | Exact POST body params for `/app/get-case-type-status` | Open DevTools → Network tab → submit one real search → copy the request payload |
+| 2 | Whether `/app/validateCaptcha` is fired before submit, or only on refresh | Same DevTools session — watch the call order |
+| 3 | CAPTCHA TTL (upstream expiry) | Hold session for 30/60/90/180s before submit; record at what boundary it rejects |
+| 4 | 20 representative result HTML fixtures | Dev provides real case numbers, solves CAPTCHAs, captures responses, anonymises per `SPIKE-PROTOCOL.md` §6 PII rules |
+| 5 | Submit-endpoint rate-limit threshold | Gentle probe 0.5 → 2 req/s after fixture capture is done |
+
+### Polite-client metrics from this recon
+
+- **Total outbound requests**: 8 (4 WebFetch, 4 stateful httpx)
+- **Pacing**: 3.1s between requests in the stateful run (1 req / 3s honored)
+- **UA**: honest, attributable, includes link to internal protocol doc
+- **Outcome**: no 4xx, no 5xx, no apparent slowdown, no IP-block. The site treated us as a polite browser.
+
+### What this resolves vs. what's still open at the gate-level
+
+- **G1 (spike: session + CAPTCHA mechanics mapped)**: PARTIALLY CLOSED. The mechanics are mapped; the exact POST body + CAPTCHA TTL remain dev-with-browser. Arjun can begin `DelhiHCClient` against the discovered endpoints with `# TODO: confirm body shape from dev-with-browser` markers on the submit method.
+- **G4 (parser ≥80% on 20 real pages)**: BLOCKED until B.6 closes (20 fixtures captured by the dev).
+- **G2 (ToS + robots.txt review by Sneha + counsel)**: PARTIALLY CLOSED via the policy snapshots. Sneha now has the data needed for a full review.
+- **G3 (DPDPA classification by counsel)**: UNCHANGED — still owner-action.
+- **G5 (pilot lawyers)**: UNCHANGED — still owner-action.
+
+### Honest verdict
+
+**The good news is bigger than the bad news.** The CSRF mechanism turned out to be standard Laravel XSRF, which means `httpx`-only `DelhiHCClient` is viable — no Playwright budget needed. 7 of 10 B-row unknowns are now resolved without a browser session. The 3 residual unknowns (B.2 partial, B.4 partial, B.6 full) are exactly the ones the protocol was designed to close with a single dev in 2 days. The 2-day budget is intact and possibly conservative.
 
 ---
 

@@ -68,3 +68,7 @@ desktop.ini
 # ── Local override files ──────────────────────────────────────────────────────
 docker-compose.override.yml
 docker-compose.local.yml
+
+# ── Claude Code per-developer config (permissions, agent prefs, etc.) ────────
+.claude/settings.local.json
+.claude/local/
