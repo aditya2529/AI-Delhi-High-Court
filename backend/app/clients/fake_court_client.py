@@ -7,12 +7,29 @@ error envelope the real client will use. This means the rest of the stack
 (routes, parser, persistence) is built against a stable contract and the
 real `DelhiHCClient` is a drop-in replacement post-spike.
 
+CAPTCHA MODE — dev/prod parity:
+  Real Delhi HC serves arithmetic CAPTCHAs (e.g. "17 + 3 ="), NOT
+  alphanumeric text. We default to MATH so the dev experience matches
+  production and the team never re-builds a flow around a wrong CAPTCHA
+  shape. TEXT mode is kept behind a flag (`captcha_mode='text'` kwarg or
+  `FAKE_COURT_CAPTCHA_MODE=text` env) as a regression net for the day
+  Delhi HC ever adds an alphanumeric option.
+
 Fake behaviours:
 * `init_session()` — no-op metadata; just attaches a synthetic cookie.
-* `fetch_captcha()` — draws 5 random alphanumeric chars on a noisy
-  200x80 PNG using PIL.
+* `fetch_captcha()` —
+    - MATH mode (default): random `a + b` with a,b in [1,50]; rendered on
+      a small white PNG. Integer answer is stashed in `upstream_token`
+      (which the route layer persists to `session.csrf_tokens["upstream_token"]`).
+    - TEXT mode: 5 random alphanumeric chars on a noisy 200x80 PNG.
 * `submit_search()` — sleeps a realistic 0.3-1.0s, then either:
     - returns `CaptchaIncorrectError` if the user literally typed "WRONG"
+      (case-insensitive sentinel — works in both modes)
+    - MATH mode: parses `captcha_text` as int, compares to the answer
+      stored on the session. Non-integer or mismatch → CaptchaIncorrectError.
+      If no answer is stored (session was built without `fetch_captcha`),
+      math validation is skipped — keeps unit-test ergonomics where a
+      session is hand-rolled.
     - reads HTML from `parsers/fixtures/sample_responses/` based on the
       (case_type, case_number, year) tuple
     - falls back to NOTFOUND.html for unknown tuples
@@ -23,13 +40,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import os
 import random
 import re
 import string
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -42,6 +60,24 @@ from app.clients.court_client import (
 )
 from app.runtime_flags import get_flags
 from app.sessions.store import CourtSession
+
+
+CaptchaMode = Literal["math", "text"]
+
+# Default CAPTCHA mode matches the real Delhi HC site (arithmetic). TEXT
+# mode is opt-in via constructor kwarg or env var.
+_DEFAULT_CAPTCHA_MODE: CaptchaMode = "math"
+_ENV_CAPTCHA_MODE = "FAKE_COURT_CAPTCHA_MODE"
+
+# Math operand range — sums land in 2-100 (1-3 digit answers), matching
+# the real-world observation from the founder's 2026-05-17 test
+# ("19 + 3 =" → 22, see docs/DEMO-FEEDBACK.md item #6).
+_MATH_OPERAND_MIN = 1
+_MATH_OPERAND_MAX = 50
+
+# Real-site CAPTCHA visual style: small white background, dark text. We
+# guess at ~180x60px since Maya hasn't pinned the exact dimensions yet.
+_MATH_IMAGE_SIZE = (180, 60)
 
 
 # Project-root-relative fixtures path. Resolves to
@@ -85,13 +121,13 @@ def _resolve_fixture_path(case_type: str, case_number: str, year: int) -> Path:
     return _FIXTURES_DIR / "NOTFOUND.html"
 
 
-def _generate_captcha_png(text: str) -> bytes:
+def _generate_text_captcha_png(text: str) -> bytes:
     """Render `text` on a 200x80 noisy PNG. Returns raw bytes.
 
     Uses PIL's default bitmap font — no system font dependency. Adds
     random pixel noise + a few sweeping lines so the image isn't pure
     text. Good enough for a human to read; we don't actually validate
-    the answer in `FakeCourtClient`.
+    the answer in `FakeCourtClient` text mode.
     """
     img = Image.new("RGB", (200, 80), color=(245, 245, 245))
     draw = ImageDraw.Draw(img)
@@ -126,6 +162,33 @@ def _generate_captcha_png(text: str) -> bytes:
     return buf.getvalue()
 
 
+def _generate_math_captcha_png(prompt: str) -> bytes:
+    """Render `prompt` (e.g. '17 + 3 =') on a small white PNG.
+
+    Visual style mirrors real-world Delhi HC observation: clean white
+    background, dark text, no noise lines. Real-site exact dimensions
+    are not yet pinned (Maya bucket); we use ~180x60 as a reasonable
+    guess. Fail-soft on system-font absence — fall back to the bitmap.
+    """
+    width, height = _MATH_IMAGE_SIZE
+    img = Image.new("RGB", (width, height), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("arial.ttf", 28)
+    except OSError:
+        font = ImageFont.load_default()
+    # Centre horizontally; the textbbox API lets us measure first.
+    bbox = draw.textbbox((0, 0), prompt, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    x = max(0, (width - text_w) // 2)
+    y = max(0, (height - text_h) // 2 - 4)
+    draw.text((x, y), prompt, fill=(30, 30, 30), font=font)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _random_captcha_text(n: int = 5) -> str:
     """5-char uppercase alphanumeric, no 0/O/1/I to keep humans happy."""
     alphabet = "".join(
@@ -134,11 +197,45 @@ def _random_captcha_text(n: int = 5) -> str:
     return "".join(random.choice(alphabet) for _ in range(n))
 
 
+def _random_math_problem() -> tuple[str, int]:
+    """Return (prompt, answer). e.g. ('17 + 3 =', 20).
+
+    Operands are 1..50 so the answer fits the 1-3 digit answer space the
+    real site uses. Only addition for now — matches every observed
+    real-world sample.
+    """
+    a = random.randint(_MATH_OPERAND_MIN, _MATH_OPERAND_MAX)
+    b = random.randint(_MATH_OPERAND_MIN, _MATH_OPERAND_MAX)
+    return f"{a} + {b} =", a + b
+
+
+def _resolve_captcha_mode(explicit: Optional[CaptchaMode]) -> CaptchaMode:
+    """Pick the effective mode: explicit kwarg > env var > default."""
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(_ENV_CAPTCHA_MODE, "").strip().lower()
+    if raw in ("math", "text"):
+        return raw  # type: ignore[return-value]
+    return _DEFAULT_CAPTCHA_MODE
+
+
 class FakeCourtClient(CourtClient):
     """Drop-in fake. Never touches the wire."""
 
-    def __init__(self, *, fixtures_dir: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        *,
+        fixtures_dir: Optional[Path] = None,
+        captcha_mode: Optional[CaptchaMode] = None,
+    ) -> None:
+        """Wire fixtures + captcha mode.
+
+        `captcha_mode` overrides the `FAKE_COURT_CAPTCHA_MODE` env var.
+        Both are optional; default is `'math'` to match the real Delhi HC
+        site. See module docstring for rationale.
+        """
         self._fixtures_dir = fixtures_dir or _FIXTURES_DIR
+        self._captcha_mode: CaptchaMode = _resolve_captcha_mode(captcha_mode)
 
     # ─── CourtClient interface ─────────────────────────────────────────
 
@@ -165,18 +262,33 @@ class FakeCourtClient(CourtClient):
         }
 
     async def fetch_captcha(self, *, session: CourtSession) -> CaptchaFetchResult:
-        """Generate a synthetic CAPTCHA image."""
+        """Generate a synthetic CAPTCHA image.
+
+        MATH mode: the integer answer is returned in `upstream_token` so
+        the route layer persists it onto `session.csrf_tokens["upstream_token"]`
+        and `submit_search` can compare against the user's typed answer.
+
+        TEXT mode: `upstream_token` is an opaque random hex (no
+        server-side validation — only the WRONG sentinel matters).
+        """
         self._guard_outbound_enabled()
         await self._fake_latency()
-        text = _random_captcha_text()
-        png_bytes = _generate_captcha_png(text)
+        if self._captcha_mode == "math":
+            prompt, answer = _random_math_problem()
+            png_bytes = _generate_math_captcha_png(prompt)
+            # The answer travels through the route layer as
+            # CaptchaFetchResult.upstream_token, which gets stored on the
+            # persisted session — `submit_search` reads it back from there.
+            token = str(answer)
+        else:
+            text = _random_captcha_text()
+            png_bytes = _generate_text_captcha_png(text)
+            token = uuid.uuid4().hex
         return CaptchaFetchResult(
             image_bytes=png_bytes,
             image_mime="image/png",
             fetched_at_unix=time.time(),
-            # The real client would echo the upstream token here. We stash
-            # nothing security-relevant in the fake.
-            upstream_token=uuid.uuid4().hex,
+            upstream_token=token,
         )
 
     async def submit_search(
@@ -185,15 +297,20 @@ class FakeCourtClient(CourtClient):
         session: CourtSession,
         captcha_text: str,
     ) -> CaseSearchResult:
-        """Read fixture HTML for the case tuple; respect WRONG sentinel."""
+        """Read fixture HTML for the case tuple; validate CAPTCHA per mode."""
         self._guard_outbound_enabled()
         await self._fake_latency()
 
         # Sentinel: literal "WRONG" simulates upstream captcha rejection.
+        # Honoured in BOTH modes — useful for forcing the failure path in
+        # integration tests without computing a math answer.
         if captcha_text.strip().upper() == "WRONG":
             raise CaptchaIncorrectError(
                 "Fake client: simulated 'Invalid Captcha' rejection"
             )
+
+        if self._captcha_mode == "math":
+            self._validate_math_captcha(session=session, captcha_text=captcha_text)
 
         path = _resolve_fixture_path(
             session.case_type, session.case_number, session.year
@@ -215,6 +332,39 @@ class FakeCourtClient(CourtClient):
         return True
 
     # ─── Helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_math_captcha(*, session: CourtSession, captcha_text: str) -> None:
+        """Compare the user's typed integer against the stored answer.
+
+        The stored answer lives on `session.csrf_tokens["upstream_token"]`
+        (written by the route layer after `fetch_captcha`). If absent —
+        e.g. a unit test that constructs a session directly without a
+        prior captcha fetch — we skip validation rather than raise, so
+        hand-rolled sessions remain ergonomic. The end-to-end flow always
+        populates the field, so the production-shaped path stays honest.
+
+        Non-integer input or numeric mismatch → CaptchaIncorrectError.
+        """
+        expected_raw = session.csrf_tokens.get("upstream_token", "").strip()
+        if not expected_raw:
+            return  # no stored answer — see docstring
+        try:
+            expected = int(expected_raw)
+        except ValueError:
+            # Stored value isn't a math answer (e.g. text-mode hex from a
+            # mode swap). Skip — don't punish the caller for our state.
+            return
+        try:
+            submitted = int(captcha_text.strip())
+        except ValueError as exc:
+            raise CaptchaIncorrectError(
+                "Fake client: math captcha answer must be an integer"
+            ) from exc
+        if submitted != expected:
+            raise CaptchaIncorrectError(
+                f"Fake client: math captcha answer {submitted} != {expected}"
+            )
 
     @staticmethod
     async def _fake_latency() -> None:

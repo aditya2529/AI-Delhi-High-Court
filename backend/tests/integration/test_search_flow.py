@@ -34,6 +34,26 @@ def _stub_response(resp) -> bool:
     return resp.status_code == 501
 
 
+async def _math_answer_for_session(session_id: str) -> str:
+    """Read the FakeCourtClient's math CAPTCHA answer off the live store.
+
+    FakeCourtClient defaults to math CAPTCHAs (matches real Delhi HC, see
+    docs/DEMO-FEEDBACK.md item #6). The answer is stashed on the persisted
+    session under ``csrf_tokens["upstream_token"]`` — we reach in here so
+    integration tests can submit a *correct* answer end-to-end without
+    OCR'ing the rendered image. Production code never reads this field
+    via test surface; the route layer simply persists it for the
+    in-process fake to validate against on submit.
+    """
+    from app.services.dependencies import get_session_store
+    store = get_session_store()
+    s = await store.get(session_id)
+    assert s is not None, f"session {session_id!r} missing from store"
+    answer = s.csrf_tokens.get("upstream_token", "")
+    assert answer, "FakeCourtClient (math mode) must seed upstream_token"
+    return answer
+
+
 # ── Validation tests (work against the skeleton — Pydantic catches these) ─
 
 class TestSearchInitValidation:
@@ -139,12 +159,12 @@ class TestSearchFlow:
         assert "captcha_image_b64" in init_body
         assert "captcha_expires_at" in init_body
 
-        # The FakeCourtClient is fixture-driven; in test mode it accepts a
-        # well-known "TEST" CAPTCHA. Real impl will accept whatever the
-        # fixture's expected CAPTCHA text is.
+        # FakeCourtClient defaults to math CAPTCHAs (matches real Delhi HC).
+        # Read the answer off the persisted session and submit it back.
+        answer = await _math_answer_for_session(init_body["session_id"])
         submit = await async_client.post("/api/v1/search/submit", json={
             "session_id": init_body["session_id"],
-            "captcha_text": "TEST",
+            "captcha_text": answer,
         })
         assert submit.status_code == 200
         body = submit.json()
@@ -225,8 +245,9 @@ class TestSearchFlow:
             pytest.xfail("search.init is a skeleton (501)")
         sid = init.json()["session_id"]
 
+        answer = await _math_answer_for_session(sid)
         resp = await async_client.post("/api/v1/search/submit", json={
-            "session_id": sid, "captcha_text": "TEST",
+            "session_id": sid, "captcha_text": answer,
         })
         assert resp.status_code == 200
         body = resp.json()
@@ -258,8 +279,9 @@ class TestSearchFlow:
 
         assert init.status_code == 200
         sid = init.json()["session_id"]
+        answer = await _math_answer_for_session(sid)
         resp = await async_client.post("/api/v1/search/submit", json={
-            "session_id": sid, "captcha_text": "TEST",
+            "session_id": sid, "captcha_text": answer,
         })
         if resp.status_code == 503:
             assert resp.json()["error"]["code"] == "court_error"
