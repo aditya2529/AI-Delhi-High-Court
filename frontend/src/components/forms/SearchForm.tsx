@@ -13,7 +13,11 @@
 import { useId, useMemo, useState } from "react";
 import { z } from "zod";
 
-import { CASE_TYPES } from "@/lib/case-types";
+import {
+  CASE_TYPES,
+  DEFAULT_CASE_TYPE_VALUE,
+  isKnownCaseType,
+} from "@/lib/case-types";
 import { STRINGS } from "@/lib/strings";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
@@ -49,11 +53,14 @@ export type SearchFormProps = {
   readonly bannerMessage?: string;
 };
 
-const CASE_TYPE_VALUES = CASE_TYPES.map((c) => c.value) as [string, ...string[]];
-
+// caseType is validated via a runtime membership check against the imported
+// CASE_TYPES list (148 entries after the spike). Using `z.string().refine`
+// instead of `z.enum` keeps the inferred type narrow (string) and avoids
+// regenerating a 148-tuple-string TS type on every build — the runtime
+// check is the same.
 const FormSchema = z.object({
-  caseType: z.enum(CASE_TYPE_VALUES, {
-    errorMap: () => ({ message: STRINGS.form.validationCaseType }),
+  caseType: z.string().refine(isKnownCaseType, {
+    message: STRINGS.form.validationCaseType,
   }),
   caseNumber: z
     .string()
@@ -80,7 +87,9 @@ export function SearchForm({
   const years = useMemo(yearRangeDescending, []);
   const currentYear = years[0];
 
-  const [caseType, setCaseType] = useState<string>(initialValues?.caseType ?? "");
+  const [caseType, setCaseType] = useState<string>(
+    initialValues?.caseType ?? DEFAULT_CASE_TYPE_VALUE,
+  );
   const [caseNumber, setCaseNumber] = useState<string>(
     initialValues?.caseNumber ?? "",
   );
@@ -157,9 +166,14 @@ export function SearchForm({
           disabled={submitting}
           className="mt-2 block w-full rounded-md border border-gray-300 bg-white px-3 py-2.5 text-sm text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent min-h-[44px]"
         >
-          <option value="">— Select case type —</option>
+          {/*
+            No "— Select case type —" placeholder option: the form now
+            defaults to DEFAULT_CASE_TYPE_VALUE (W.P.(C), per spike B.5)
+            so the dropdown is always sat on a valid value out of the
+            box. 148 options total, sorted alphabetically by label.
+          */}
           {CASE_TYPES.map((ct) => (
-            <option key={ct.value} value={ct.value} title={ct.description}>
+            <option key={ct.value} value={ct.value}>
               {ct.label}
             </option>
           ))}

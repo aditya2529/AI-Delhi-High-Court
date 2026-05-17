@@ -105,6 +105,24 @@ PARSE_OUTCOME_COURT_ERROR = "court_error"
 PARSE_OUTCOME_CAPTCHA_FAILED = "captcha_failed"
 
 
+# Minimum `parse_confidence` at which a result is considered safe to render
+# as a fully structured ParsedCase. Below this floor, the parser still emits
+# a ParsedCase (so the source_url + raw_html_hash flow is intact) but flags
+# `parser_degraded=True` so the route layer / frontend can fall back to the
+# "couldn't read reliably — open court site" view.
+#
+# Tuned per Arnav's Phase-0 spike (docs/SPIKE-REPORT.md §C.2). Lowered from
+# the original strict-golden-fixture band of 0.70 → 0.55 because:
+#   * 0.70 over-rejects fresh-filing pages (no orders/judgments yet) — the
+#     exact segment whose lawyers most need updates.
+#   * 0.55 demands status OR (last+next-hearing) OR (status + one hearing
+#     date), which is the minimum useful case page.
+#   * Post-B.6 (real-fixture replacement) this may need re-tuning per
+#     §C.4's adjustment rule; expose as a constant so the change is a
+#     single-line PR with a telemetry diff.
+PARSER_CONFIDENCE_FLOOR = 0.55
+
+
 @dataclass
 class ParseOutcome:
     """What the parser returns to the route layer.
@@ -223,7 +241,17 @@ class DHCParserV1(CaseParser):
                 case=degraded,
                 parser_degraded=True,
             )
-        return ParseOutcome(outcome=PARSE_OUTCOME_SUCCESS, case=case)
+
+        # Soft-degrade: extraction succeeded but the page is too thin to be
+        # confidently rendered as structured data. Flag for the route/UI to
+        # fall back to the "couldn't read reliably" view. See
+        # PARSER_CONFIDENCE_FLOOR comment for tuning rationale.
+        degraded_by_confidence = case.parse_confidence < PARSER_CONFIDENCE_FLOOR
+        return ParseOutcome(
+            outcome=PARSE_OUTCOME_SUCCESS,
+            case=case,
+            parser_degraded=degraded_by_confidence,
+        )
 
     # ─── classifiers ──────────────────────────────────────────────────
 
@@ -317,12 +345,14 @@ class DHCParserV1(CaseParser):
         judge_bench: Optional[str],
         has_orders: bool,
     ) -> float:
-        """0.5 base for parties+identity; the rest is optional-field coverage.
+        """0.40 base for parties+identity; the rest is optional-field coverage.
 
         A case page with status + (last|next) hearing + bench + orders lands
-        at ≥0.7 (the band our golden-fixture tests demand for high quality).
-        A fresh case with only parties + maybe a status + next-hearing lands
-        in the 0.4-0.6 mid-band (degraded).
+        at ≥0.70 (high-quality golden-fixture band). A fresh case with
+        parties + status + next-hearing lands at ~0.55 — right at the
+        ``PARSER_CONFIDENCE_FLOOR`` (the minimum useful case page per
+        SPIKE-REPORT §C.2). Below 0.55 the route layer treats the result
+        as degraded and the UI falls back to the source-URL link.
         """
         score = 0.40  # parties + identity already present at call time
         if status:

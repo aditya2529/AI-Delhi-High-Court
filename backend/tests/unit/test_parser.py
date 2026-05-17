@@ -1,10 +1,15 @@
 """Unit tests for the case-result HTML parser.
 
-Pins down the invariants in STRATEGIES.md §3 (Parsing Strategy):
+Pins down the invariants in STRATEGIES.md §3 (Parsing Strategy) and the
+tuned floor from SPIKE-REPORT §C.2:
   * Each golden fixture under `parsers/fixtures/sample_responses/` parses
     without raising — graceful degradation is mandatory.
   * `parse_confidence` falls in the right band per fixture
-    (full success ≥ 0.7; degraded but recognised 0.2-0.7; total failure ≤ 0.1).
+    (high-quality ≥ 0.70; at-or-above floor ≥ PARSER_CONFIDENCE_FLOOR;
+    sentinels ≤ 0.20; total failure ≤ 0.10).
+  * Results at-or-above PARSER_CONFIDENCE_FLOOR (0.55, post-spike) do NOT
+    set parser_degraded; results below it DO. This is the load-bearing
+    quality contract the UI keys its fallback view on.
   * `raw_html_hash` and `source_url` are ALWAYS populated, even on failure.
   * Sentinel detection: NOTFOUND.html and CAPTCHA_FAILED.html return
     distinct, parser-identifiable states (so the route layer can branch
@@ -28,6 +33,7 @@ import hashlib
 import pytest
 
 from app.parsers.case_parser import (
+    PARSER_CONFIDENCE_FLOOR,
     ParsedCase,
     empty_parse,
     html_fingerprint,
@@ -116,13 +122,18 @@ class TestEmptyParse:
 
 # ── Golden-fixture tests — gated on DHCParserV1 existing ─────────────────
 
-# Confidence bands per STRATEGIES §3. These pin the parser's quality contract.
+# Confidence bands per STRATEGIES §3 + SPIKE-REPORT §C.2.
+# "High-quality" still pins to ≥0.70 because the WPC/CRLMC fixtures load
+# every optional field; the *display floor* is lower (0.55) so fresh-filing
+# pages with only status + next-hearing still surface to the user.
 HIGH_CONFIDENCE_FIXTURES = [
     "WPC_12345_2024.html",
     "CRLMC_999_2023.html",
 ]
-DEGRADED_FIXTURES = [
-    "FAO_1_2025.html",   # no orders, no court_no/bench/last_hearing
+# Fixtures that land at-or-above the floor but below the strict-quality
+# band. Sit in the "rendered, NOT degraded" zone the spike lowered for.
+AT_FLOOR_FIXTURES = [
+    "FAO_1_2025.html",   # no orders, no court_no/bench/last_hearing → ~0.55
 ]
 NO_RESULT_FIXTURES = [
     "NOTFOUND.html",
@@ -141,7 +152,8 @@ class TestParserAgainstGoldenFixtures:
         self, filename, fixture_html
     ):
         """G4 (Exec-Summary): parser hits ≥80% of representative pages.
-        High-confidence fixtures must produce all required ParsedCase fields."""
+        High-confidence fixtures must produce all required ParsedCase fields
+        AND land safely above the (post-spike-lowered) display floor."""
         html = fixture_html(filename)
         parser = DHCParserV1()
         result = parser.parse(html, source_url="https://delhihighcourt.nic.in/x")
@@ -150,25 +162,43 @@ class TestParserAgainstGoldenFixtures:
         assert result.parse_confidence >= 0.7, (
             f"{filename}: expected ≥0.7 confidence, got {result.parse_confidence}"
         )
+        # Defence-in-depth — high-confidence is by definition well above the
+        # floor; if this assert ever inverts, either the fixture has been
+        # neutered or the floor logic regressed.
+        assert result.parse_confidence >= PARSER_CONFIDENCE_FLOOR
         assert result.parties, "Petitioner/respondent must be parsed"
         assert result.status is not None
         assert len(result.raw_html_hash) == 64
         assert result.source_url
 
-    @pytest.mark.parametrize("filename", DEGRADED_FIXTURES)
-    def test_degraded_fixture_parses_with_lower_confidence(
+    @pytest.mark.parametrize("filename", AT_FLOOR_FIXTURES)
+    def test_fresh_case_fixture_lands_at_or_above_floor(
         self, filename, fixture_html
     ):
-        """US-03 AC-2: missing fields render as 'Not available' — i.e., parser
-        completes WITHOUT raising and reports degraded confidence."""
+        """US-03 AC-2: missing fields render as 'Not available' — fresh
+        cases (no orders yet) must still surface to the user.
+
+        Per SPIKE-REPORT §C.2 the floor was lowered 0.70 → 0.55 precisely
+        so this fixture (a fresh filing with parties + status + next-hearing)
+        renders structured rather than falling back to the source-URL view.
+        """
         html = fixture_html(filename)
         parser = DHCParserV1()
         result = parser.parse(html, source_url="https://delhihighcourt.nic.in/x")
 
-        assert 0.2 <= result.parse_confidence < 0.7, (
-            f"{filename}: expected mid-band confidence, got {result.parse_confidence}"
+        # The headline invariant: at-or-above the floor.
+        assert result.parse_confidence >= PARSER_CONFIDENCE_FLOOR, (
+            f"{filename}: expected ≥{PARSER_CONFIDENCE_FLOOR} confidence "
+            f"(post-spike floor), got {result.parse_confidence}"
         )
-        assert result.parties, "Parties must still be extractable on a degraded page"
+        # And below the strict high-quality band — otherwise the fixture
+        # has been "improved" to a full case and no longer exercises the
+        # at-floor path.
+        assert result.parse_confidence < 0.7, (
+            f"{filename}: this fixture should sit in the [floor, 0.7) band "
+            f"— if it now scores ≥0.7, move it to HIGH_CONFIDENCE_FIXTURES"
+        )
+        assert result.parties, "Parties must still be extractable on a thin page"
 
     @pytest.mark.parametrize("filename", NO_RESULT_FIXTURES)
     def test_sentinel_pages_are_detected_distinctly(self, filename, fixture_html):
@@ -181,6 +211,9 @@ class TestParserAgainstGoldenFixtures:
         # Sentinel pages have no extractable parties; confidence is low but
         # raw_html_hash + source_url are still populated.
         assert result.parse_confidence <= 0.2
+        # And sentinels are decisively *below* the display floor so the UI
+        # never tries to render them as a structured case.
+        assert result.parse_confidence < PARSER_CONFIDENCE_FLOOR
         assert result.raw_html_hash
         assert result.source_url
 
@@ -206,6 +239,102 @@ class TestParserAgainstGoldenFixtures:
         parser = DHCParserV1()
         result = parser.parse(html, source_url="https://delhihighcourt.nic.in/x")
         assert result.parser_version  # truthy; format owned by parser module
+
+
+# ── PARSER_CONFIDENCE_FLOOR — the constant + the wiring it depends on ────
+
+@parser_impl_required
+class TestConfidenceFloorWiring:
+    """The floor is the contract between the parser and the UI fallback.
+    These tests pin both the constant and the `parser_degraded` flip
+    around it.
+    """
+
+    def test_floor_is_55_per_spike_section_c2(self):
+        """Documented value. If this changes, SPIKE-REPORT §C.2 + the
+        constant docstring in case_parser.py must change with it."""
+        assert PARSER_CONFIDENCE_FLOOR == 0.55
+
+    def test_high_confidence_fixture_is_not_flagged_degraded(self, fixture_html):
+        """A full case page MUST NOT come back degraded. If it does, either
+        the floor moved up or the parser scoring regressed."""
+        html = fixture_html("WPC_12345_2024.html")
+        parser = DHCParserV1()
+        outcome = parser.parse_with_outcome(
+            html,
+            source_url="https://delhihighcourt.nic.in/x",
+            case_type="W.P.(C)", case_number="12345", year=2024,
+        )
+        assert outcome.case is not None
+        assert outcome.case.parse_confidence >= PARSER_CONFIDENCE_FLOOR
+        assert outcome.parser_degraded is False
+
+    def test_at_floor_fixture_is_not_flagged_degraded(self, fixture_html):
+        """The whole point of lowering the floor: FAO_1_2025 (fresh filing,
+        ~0.55) must render as a structured case, NOT degraded."""
+        html = fixture_html("FAO_1_2025.html")
+        parser = DHCParserV1()
+        outcome = parser.parse_with_outcome(
+            html,
+            source_url="https://delhihighcourt.nic.in/x",
+            case_type="FAO", case_number="1", year=2025,
+        )
+        assert outcome.case is not None
+        assert outcome.case.parse_confidence >= PARSER_CONFIDENCE_FLOOR
+        assert outcome.parser_degraded is False, (
+            "FAO_1_2025 is the canonical at-floor fixture — if it now "
+            "comes back degraded, either the floor crept up past 0.55 or "
+            "the scoring regressed and fresh cases are being hidden."
+        )
+
+    def test_subfloor_synthetic_page_flips_parser_degraded(self):
+        """Adversarial: build a synthetic page that extracts cleanly but
+        scores BELOW the floor. parser_degraded must be True so the UI
+        falls back to the source-URL link instead of rendering thin data.
+
+        Shape: parties present (base 0.40) + status only (+0.10) = 0.50.
+        Nothing else. 0.50 < 0.55 → degraded.
+        """
+        thin_html = """
+        <html><body><div class="container">
+          <table class="case-details">
+            <tr><th>Status</th><td class="case-status">PENDING</td></tr>
+          </table>
+          <table class="parties">
+            <tr class="party petitioner">
+              <td class="role">Petitioner</td>
+              <td class="name">ACME LTD</td>
+            </tr>
+            <tr class="party respondent">
+              <td class="role">Respondent</td>
+              <td class="name">STATE OF X</td>
+            </tr>
+          </table>
+        </div></body></html>
+        """
+        parser = DHCParserV1()
+        outcome = parser.parse_with_outcome(
+            thin_html,
+            source_url="https://delhihighcourt.nic.in/x",
+            case_type="W.P.(C)", case_number="1", year=2024,
+        )
+        assert outcome.case is not None
+        # The synthetic page is intentionally just below the floor.
+        assert outcome.case.parse_confidence < PARSER_CONFIDENCE_FLOOR
+        assert outcome.parser_degraded is True
+
+    def test_hard_failure_still_flips_parser_degraded(self, fixture_html):
+        """Pre-existing contract: when no parties / no case-details table
+        can be extracted at all, parser_degraded MUST be True regardless
+        of the score (which will be 0.0 from empty_parse)."""
+        html = fixture_html("BROKEN.html")
+        parser = DHCParserV1()
+        outcome = parser.parse_with_outcome(
+            html,
+            source_url="https://delhihighcourt.nic.in/x",
+            case_type="W.P.(C)", case_number="1", year=2024,
+        )
+        assert outcome.parser_degraded is True
 
 
 # ── Defensive: parser is registered as the default ───────────────────────
