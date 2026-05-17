@@ -86,12 +86,22 @@ class TestCaptchaImage:
 
 class TestSubmitRoutingMathMode:
     async def test_correct_math_answer_returns_matching_fixture(self):
-        """Known (case_type, case_number, year) → that fixture's HTML."""
+        """Known (case_type, case_number, year) -> that fixture's JSON.
+
+        Post-2026-05-17 pivot: the fake now returns JSON (DataTables shape)
+        to match real upstream. We assert the JSON-envelope markers + the
+        case-identifying bits inside.
+        """
         client = FakeCourtClient(captcha_mode="math")
         session = _math_session(answer=22)
         result = await client.submit_search(session=session, captcha_text="22")
-        assert "W.P.(C) 12345/2024" in result.raw_html
-        assert "PENDING" in result.raw_html
+        # JSON envelope present.
+        assert result.raw_html.lstrip().startswith("{")
+        assert '"recordsTotal":1' in result.raw_html
+        # Case identity round-trips through ctype.
+        assert "W.P.(C)" in result.raw_html
+        assert "12345" in result.raw_html
+        assert "[PENDING]" in result.raw_html
 
     async def test_correct_three_digit_math_answer_accepted(self):
         """100 (max possible: 50+50) must parse + validate cleanly."""
@@ -126,12 +136,18 @@ class TestSubmitRoutingMathMode:
                 await client.submit_search(session=session, captcha_text=bad)
 
     async def test_unknown_tuple_falls_back_to_notfound(self):
-        """Unknown tuple → NOTFOUND fixture (mirrors real court behaviour)."""
+        """Unknown tuple -> NOTFOUND fixture (mirrors real court behaviour).
+
+        Post-pivot: the live DataTables endpoint signals "no records" by
+        returning ``recordsTotal: 0, data: []`` (not an HTML "No records
+        found" page). The fake now serves NOTFOUND.json to keep parity.
+        """
         client = FakeCourtClient(captcha_mode="math")
         session = _math_session(answer=15, case_type="ZZ",
                                 case_number="0", year=2020)
         result = await client.submit_search(session=session, captcha_text="15")
-        assert "No records found" in result.raw_html
+        assert '"recordsTotal":0' in result.raw_html
+        assert '"data":[]' in result.raw_html
 
     async def test_case_number_court_error_returns_court_error_fixture(self):
         """Test hook: explicit sentinel `case_number='COURT_ERROR'` surfaces
@@ -197,15 +213,19 @@ class TestTextModeRegression:
         assert len(result.upstream_token) >= 16
 
     async def test_text_mode_accepts_any_non_wrong_text(self):
-        """TEXT mode does not server-side-validate — only WRONG rejects.
-        This mirrors the original behaviour pre-2026-05-17."""
+        """TEXT mode does not server-side-validate -- only WRONG rejects.
+        This mirrors the original behaviour pre-2026-05-17. JSON-shape
+        assertion since the fake now returns JSON envelopes.
+        """
         client = FakeCourtClient(captcha_mode="text")
         session = CourtSession(session_id="x", case_type="W.P.(C)",
                                case_number="12345", year=2024)
         result = await client.submit_search(
             session=session, captcha_text="ABCDE",
         )
-        assert "W.P.(C) 12345/2024" in result.raw_html
+        assert '"recordsTotal":1' in result.raw_html
+        assert "W.P.(C)" in result.raw_html
+        assert "12345" in result.raw_html
 
 
 class TestModeResolution:
@@ -239,6 +259,84 @@ class TestModeResolution:
                                case_number="1", year=2024)
         result = await client.fetch_captcha(session=session)
         assert 2 <= int(result.upstream_token) <= 100
+
+
+class TestFakeJsonShapeFeedsParser:
+    """Contract: the JSON the fake serves MUST round-trip through
+    DHCParserV1 cleanly. This is the dev/prod parity guarantee — if
+    this test fails, fake-mode users see a different shape than what
+    real-mode users see, and the team builds against the wrong contract.
+    """
+
+    async def _round_trip(
+        self, *, case_type: str, case_number: str, year: int, answer: int,
+    ):
+        from app.parsers.case_parser import DHCParserV1
+        client = FakeCourtClient(captcha_mode="math")
+        session = _math_session(
+            answer=answer, case_type=case_type,
+            case_number=case_number, year=year,
+        )
+        result = await client.submit_search(
+            session=session, captcha_text=str(answer)
+        )
+        parser = DHCParserV1()
+        return parser.parse_with_outcome(
+            result.raw_html, source_url=result.source_url,
+            case_type=case_type, case_number=case_number, year=year,
+        )
+
+    async def test_wpc_fixture_parses_cleanly_through_parser(self):
+        outcome = await self._round_trip(
+            case_type="W.P.(C)", case_number="12345", year=2024, answer=22,
+        )
+        assert outcome.outcome == "success"
+        assert outcome.parser_degraded is False
+        case = outcome.case
+        assert case is not None
+        assert case.status == "Pending"  # mapped from "P " + [PENDING]
+        assert case.last_hearing_date == "2026-05-10"
+        assert case.next_hearing_date == "2026-06-04"
+        assert case.court_no == "12"
+        assert any(p.role == "petitioner" for p in case.parties)
+        assert any(p.role == "respondent" for p in case.parties)
+
+    async def test_crlmc_fixture_parses_cleanly_through_parser(self):
+        outcome = await self._round_trip(
+            case_type="CRL.M.C.", case_number="999", year=2023, answer=33,
+        )
+        assert outcome.outcome == "success"
+        assert outcome.parser_degraded is False
+        case = outcome.case
+        assert case is not None
+        assert case.status == "Disposed"
+        assert case.last_hearing_date == "2026-03-14"
+        # CRLMC orderdate has "NEXT DATE: NA" → should be None.
+        assert case.next_hearing_date is None
+        assert case.court_no == "7"
+
+    async def test_fao_fresh_case_fixture_parses_through_parser(self):
+        """Fresh case (no orders) - lower confidence band but still NOT
+        degraded (above the 0.55 floor)."""
+        outcome = await self._round_trip(
+            case_type="FAO", case_number="1", year=2025, answer=44,
+        )
+        assert outcome.outcome == "success"
+        # FAO has no orders, no court_no, no last_hearing → confidence
+        # sits around 0.60-0.65 (above floor, below 0.70 high-quality band).
+        case = outcome.case
+        assert case is not None
+        assert case.status == "Pending"
+        assert case.next_hearing_date == "2026-06-12"
+
+    async def test_unknown_tuple_parses_as_not_found(self):
+        """Fake returns NOTFOUND.json for unknown case → parser
+        classifies as not_found sentinel. End-to-end contract."""
+        outcome = await self._round_trip(
+            case_type="ZZ", case_number="0", year=2020, answer=55,
+        )
+        assert outcome.outcome == "not_found"
+        assert outcome.case is None
 
 
 class TestKillSwitch:

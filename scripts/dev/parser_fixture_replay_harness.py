@@ -100,7 +100,7 @@ BRANCH_AT_FLOOR = "extraction:success_at_or_above_floor"
 # `WPC_12345_2024.html`, `CRLMC_999_2023.html`, `FAO_1_2025.html`. Falls back
 # to safe placeholders if the file is named anything else.
 _FILENAME_RE = re.compile(
-    r"^(?P<type>[A-Z]+)_(?P<num>\d+)_(?P<year>\d{4})\.html$",
+    r"^(?P<type>[A-Z]+)_(?P<num>\d+)_(?P<year>\d{4})(?:_\d+)?\.(?:html|json)$",
     re.IGNORECASE,
 )
 
@@ -407,18 +407,27 @@ def _run_single(args: argparse.Namespace, fixture_path: Path) -> int:
 
 
 def _run_directory(args: argparse.Namespace, dir_path: Path) -> int:
-    """Walk *.html under dir_path; print table; exit 1 if any degraded.
+    """Walk *.html AND *.json under dir_path; print table; exit 1 if any degraded.
 
     Hidden files (.DS_Store etc.) and the README.md are ignored. Sort
     order is alphabetical for stable diff output across runs.
+
+    Post-2026-05-17 pivot: walks both extensions because the live
+    case-search endpoint returns JSON while error/sentinel pages may
+    still be HTML. The parser auto-detects by sniffing the body.
     """
     html_files = sorted(
         p for p in dir_path.rglob("*.html")
         if not p.name.startswith(".") and p.is_file()
     )
+    json_files = sorted(
+        p for p in dir_path.rglob("*.json")
+        if not p.name.startswith(".") and p.is_file()
+    )
+    html_files = sorted(set(html_files) | set(json_files), key=lambda p: p.name)
     if not html_files:
         print(
-            f"WARNING: no .html fixtures under {dir_path} -- "
+            f"WARNING: no .html or .json fixtures under {dir_path} -- "
             "harness has nothing to validate.",
             file=sys.stderr,
         )

@@ -176,13 +176,20 @@ class TestDirectoryMode:
         assert rc == 1
 
     def test_empty_directory_warns_and_exits_zero(self, tmp_path, capsys):
-        """No fixtures → can't be degraded → exit 0, but log a warning so
-        the CI run isn't silent about it."""
+        """No fixtures -> can't be degraded -> exit 0, but log a warning so
+        the CI run isn't silent about it.
+
+        Post-2026-05-17 pivot: harness walks both .html AND .json (real
+        upstream returns JSON). Warning text now says "no .html or .json
+        fixtures" — we assert the suffix substring so the test survives
+        future wording tweaks.
+        """
         rc = harness.main([str(tmp_path)])
         captured = capsys.readouterr()
         assert rc == 0
         assert "WARNING" in captured.err
-        assert "no .html fixtures" in captured.err
+        assert "fixtures" in captured.err
+        assert "no .html" in captured.err  # both old + new wording match
 
     def test_directory_walk_is_recursive(self, tmp_path, capsys):
         """Founder may organise fixtures by case-id subdirectories. The

@@ -65,6 +65,13 @@ def _test_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.setenv("ADMIN_SHARED_SECRET", "test-admin-secret")
     monkeypatch.setenv("OUTBOUND_FETCH_ENABLED", "true")
     monkeypatch.setenv("CLIENT_MODE", "fake")
+    # Point file logging at a per-test tmp file so we never write to the
+    # project's ``logs/`` directory during tests. Individual tests that
+    # want to assert specific logging behaviour (see test_admin.py
+    # ``TestAuditByRequestId`` / ``TestFileLoggingDoD``) override this
+    # with their own ``monkeypatch.setenv`` + ``get_settings.cache_clear``.
+    monkeypatch.setenv("LOG_FILE_BACKEND", str(tmp_path / "app.log"))
+    monkeypatch.setenv("LOG_FILE_OUTBOUND", str(tmp_path / "outbound.log"))
     # Wipe the lru_cache so each test gets a fresh Settings() object.
     from app.config import get_settings  # local import — env must be set first
     get_settings.cache_clear()
@@ -113,15 +120,30 @@ def short_ttl_session_store():
 # ── Fixture loader ─────────────────────────────────────────────────────────
 @pytest.fixture
 def fixture_html() -> Callable[[str], str]:
-    """Returns a function: name -> raw HTML string. Raises if not found."""
+    """Returns a function: name -> raw HTML/JSON string. Raises if not found.
+
+    Post-2026-05-17 JSON pivot: case fixtures (WPC/CRLMC/FAO) live under
+    ``_legacy_html/`` because the real upstream now returns JSON. Sentinel
+    HTML pages (BROKEN, NOTFOUND, CAPTCHA_FAILED, COURT_ERROR) stay at
+    the top level - they may still appear as HTML in upstream error paths
+    (Apache 500, etc.). The loader searches both locations so existing
+    tests don't need to know where each fixture lives.
+    """
+    legacy_dir = FIXTURES_DIR / "_legacy_html"
+
     def _load(name: str) -> str:
-        path = FIXTURES_DIR / name
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Test fixture missing: {path}. "
-                f"Expected one of {sorted(p.name for p in FIXTURES_DIR.glob('*.html'))}."
-            )
-        return path.read_text(encoding="utf-8")
+        for candidate in (FIXTURES_DIR / name, legacy_dir / name):
+            if candidate.exists():
+                return candidate.read_text(encoding="utf-8")
+        seen = sorted(
+            [p.name for p in FIXTURES_DIR.glob("*.html")]
+            + [f"_legacy_html/{p.name}" for p in legacy_dir.glob("*.html")]
+        )
+        raise FileNotFoundError(
+            f"Test fixture missing: {name}. "
+            f"Searched {FIXTURES_DIR} and {legacy_dir}. "
+            f"Available: {seen}."
+        )
     return _load
 
 
@@ -176,12 +198,25 @@ async def async_client(app_instance):
 
     We invoke the app's lifespan manually because httpx.ASGITransport
     does not drive lifespan events. Without this the startup
-    `alembic upgrade head` never runs and tables don't exist.
+    `alembic upgrade head` never runs and tables don't exist — and the
+    file-logging handlers wired by ``configure_logging`` never get
+    attached either, which would silently regress the founder's
+    "0-byte app.log" incident (2026-05-17).
     """
     import httpx
+    from app.config import get_settings
     from app.main import _run_alembic_upgrade
+    from app.utils.logging import configure_logging
 
-    # Run migrations against the test tempfile DB before any request fires.
+    # Mirror lifespan startup: re-wire file logging against the current
+    # per-test ``LOG_FILE_BACKEND`` env (set by ``_test_env`` or a
+    # test-specific ``monkeypatch.setenv``), then run migrations.
+    settings = get_settings()
+    configure_logging(
+        log_level=settings.app_log_level,
+        log_file=settings.log_file_backend,
+        log_file_outbound=settings.log_file_outbound,
+    )
     _run_alembic_upgrade()
 
     transport = httpx.ASGITransport(app=app_instance)

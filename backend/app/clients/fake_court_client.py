@@ -96,28 +96,42 @@ def _slugify_case_type(case_type: str) -> str:
 
 
 def _fixture_filename(case_type: str, case_number: str, year: int) -> str:
-    """Build the fixture filename from a case tuple."""
+    """Build the JSON fixture filename from a case tuple.
+
+    Post-2026-05-17 pivot: case-search responses are JSON, not HTML, so
+    the case fixtures live as ``.json`` files. Sentinel HTML pages (the
+    Apache/Laravel 500, "No records found", "Invalid Captcha") remain
+    ``.html`` because that's the actual shape the upstream serves for
+    those error paths.
+    """
     slug = _slugify_case_type(case_type)
-    return f"{slug}_{case_number}_{year}.html"
+    return f"{slug}_{case_number}_{year}.json"
 
 
 def _resolve_fixture_path(case_type: str, case_number: str, year: int) -> Path:
     """Resolve to a real fixture path; fallback to NOTFOUND for unknown tuples.
 
     Special routes (test hooks, documented in the fixtures README):
-      * `case_number.upper() == 'COURT_ERROR'` → COURT_ERROR.html
+      * ``case_number.upper() == 'COURT_ERROR'`` → COURT_ERROR.html
         (simulates upstream 500). Explicit selector by design — the
-        previous `year == 1900` heuristic coupled the test hook to
+        previous ``year == 1900`` heuristic coupled the test hook to
         in-band data; explicit sentinel is cleaner.
 
     The real Delhi HC site returns a "no records found" page for any
-    unknown case — we mirror that behaviour here for the default path.
+    unknown case — we mirror that behaviour here for the default path,
+    serving the JSON empty-result envelope (``NOTFOUND.json``) since
+    that's what the live DataTables endpoint actually emits. Falls
+    back to ``NOTFOUND.html`` if the JSON variant is missing (defensive
+    transition support).
     """
     if case_number.upper() == "COURT_ERROR":
         return _FIXTURES_DIR / "COURT_ERROR.html"
     direct = _FIXTURES_DIR / _fixture_filename(case_type, case_number, year)
     if direct.is_file():
         return direct
+    not_found_json = _FIXTURES_DIR / "NOTFOUND.json"
+    if not_found_json.is_file():
+        return not_found_json
     return _FIXTURES_DIR / "NOTFOUND.html"
 
 

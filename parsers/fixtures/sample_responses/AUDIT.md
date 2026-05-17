@@ -1,11 +1,53 @@
 # Synthetic Fixture Audit vs Spike Findings
 
-**Status:** Pre-B.6 placeholder audit · **Auditor:** Maya (QA) · **Date:** 2026-05-17
+**Status:** Post-B.6 JSON pivot — fixtures regenerated · **Auditor:** Maya (QA)
+**Last update:** 2026-05-17 (JSON pivot day)
 **Inputs:** `docs/SPIKE-REPORT.md` §C (stateful recon) + §G (per-unknown
-resolution map), `scripts/dev/spike_recon_output.json`
-**Goal:** rank each synthetic fixture for structural plausibility against
-what Arnav observed on the live court site. This audit feeds the post-B.6
-real-fixture replacement work — it does NOT itself rewrite the fixtures.
+resolution map), `scripts/dev/spike_recon_output.json`, captured real
+fixture `../real_responses/WPC_2344_2024_*.json`
+**Goal:** document each fixture's role + shape after the post-2026-05-17
+JSON pivot. The case-search endpoint returns DataTables JSON, not HTML —
+the case fixtures here have been regenerated to match that real shape.
+
+## 2026-05-17 (PM) — JSON pivot landed
+
+**Action taken (this commit):**
+- The three case fixtures (WPC, CRLMC, FAO) are now JSON files
+  (`WPC_12345_2024.json` etc.) matching the captured real shape from
+  `../real_responses/WPC_2344_2024_*.json`. Each contains placeholder
+  data (synthetic party names, dates, court numbers) in the real
+  DataTables envelope (`{draw, recordsTotal, data: [{ctype, cno, ...}]}`).
+- The previous HTML versions live under `_legacy_html/` as a regression
+  anchor for the parser's HTML-fallback path (the parser is dual-mode —
+  JSON-primary, HTML-fallback — and the HTML golden fixtures still gate
+  the fallback). They are NOT deleted because they remain the only
+  known-good test surface for the HTML branch.
+- The sentinel pages (`NOTFOUND`, `CAPTCHA_FAILED`, `COURT_ERROR`,
+  `BROKEN`) keep their `.html` form because they represent error PAGES,
+  not data responses. A new companion `NOTFOUND.json` was added — it
+  mirrors the way the live DataTables endpoint signals "no records"
+  (an empty `data: []` envelope), so the fake court client serves it
+  for unknown case lookups (dev/prod parity).
+- The FakeCourtClient now serves the `.json` fixtures by default; the
+  parser auto-detects mode by sniffing the body (no client signature
+  change required).
+- The captured fixture under `../real_responses/` has been renamed from
+  `.html` to `.json` to match its true content type. The response
+  capture layer now picks the extension based on the upstream's
+  `Content-Type` header (or sniffs the body if the header is missing).
+
+**Sentinel fixture roles — explicit documentation per founder spec:**
+
+| File | Represents | Why kept as .html (not .json) |
+|---|---|---|
+| `NOTFOUND.html` | HTML "No records found" page (legacy synthetic). | Belt-and-braces: if upstream ever serves an HTML banner for no-results, the parser still catches it via `_NOT_FOUND_SELECTORS`. |
+| `NOTFOUND.json` | DataTables empty-result envelope (`recordsTotal:0, data:[]`). | This IS what the live JSON endpoint emits for unknown cases — used by FakeCourtClient default fallback. |
+| `CAPTCHA_FAILED.html` | "Invalid Captcha" HTML banner (synthetic). | The live captcha flow rejects via `/app/validateCaptcha` HTTP 4xx BEFORE the result page, so this fixture is a safety net for the day upstream changes that. |
+| `COURT_ERROR.html` | Synthetic 500 page with `.error-page` class. | Apache/Laravel 500 pages ARE HTML by nature. Pure-HTML fixture exercises the parser's HTML sentinel path. |
+| `BROKEN.html` | Totally malformed HTML (unclosed tags, no markers). | Adversarial regression — must not crash the HTML branch. Permanent keeper. |
+| `_legacy_html/*.html` | Pre-pivot HTML golden case fixtures. | Regression anchor for the parser's HTML-fallback path (parser is dual-mode). |
+
+## Older notes (pre-B.6, retained for historical context)
 
 ## 2026-05-17 demo update — synthetic fixtures DO NOT match real HTML
 
