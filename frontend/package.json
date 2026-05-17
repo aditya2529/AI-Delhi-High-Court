@@ -4,7 +4,7 @@
   "private": true,
   "description": "Next.js frontend for the Delhi HC Case Tracker MVP. Workflow-simplification UI over the public Delhi High Court case-status search.",
   "scripts": {
-    "dev": "next dev -p 3000",
+    "dev": "node ../scripts/dev/dev-frontend.mjs",
     "build": "next build",
     "start": "next start -p 3000",
     "lint": "next lint",
