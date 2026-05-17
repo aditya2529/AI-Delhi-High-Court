@@ -61,7 +61,7 @@ export type SearchInitRequest = z.infer<typeof SearchInitRequestSchema>;
 
 export const SearchInitResponseSchema = z
   .object({
-    session_id: z.string().uuid(),
+    session_id: z.string().min(8).max(64),
     captcha_image_b64: z.string().min(1),
     captcha_mime: z.string().min(1),
     captcha_expires_at: z.string(),
@@ -130,9 +130,26 @@ export const SUBMIT_STATUSES = [
 ] as const;
 export type SubmitStatus = (typeof SUBMIT_STATUSES)[number];
 
+/**
+ * CAPTCHA answer length bounds — the single source of truth for both the
+ * Zod request schema below and any UI component that gates submit on length.
+ *
+ * Mirrors backend Pydantic `SearchSubmitRequest.captcha_text =
+ * Field(..., min_length=1, max_length=10)` in `backend/app/schemas/search.py`.
+ *
+ * Why 1 (not 3)? Delhi HC serves MATH CAPTCHAs (e.g. "19 + 3 =") whose
+ * answers can be a single digit ("5+2=7"). Pinning min to 3 silently blocks
+ * the most common case. See docs/DEMO-FEEDBACK.md item #6.
+ *
+ * If these bounds ever change, change them HERE — every downstream consumer
+ * (Zod schema, UI input attrs, submit-disable check) imports them.
+ */
+export const MIN_CAPTCHA_LENGTH = 1;
+export const MAX_CAPTCHA_LENGTH = 10;
+
 export const SearchSubmitRequestSchema = z.object({
-  session_id: z.string().uuid(),
-  captcha_text: z.string().min(1).max(10),
+  session_id: z.string().min(8).max(64),
+  captcha_text: z.string().min(MIN_CAPTCHA_LENGTH).max(MAX_CAPTCHA_LENGTH),
 });
 export type SearchSubmitRequest = z.infer<typeof SearchSubmitRequestSchema>;
 

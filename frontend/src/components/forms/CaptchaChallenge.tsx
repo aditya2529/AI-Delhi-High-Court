@@ -17,9 +17,11 @@
 import { useEffect, useId, useRef, useState } from "react";
 
 import { ApiError, refreshCaptcha, searchSubmit } from "@/services/api";
-import type {
-  RefreshCaptchaResponse,
-  SearchSubmitResponse,
+import {
+  MAX_CAPTCHA_LENGTH,
+  MIN_CAPTCHA_LENGTH,
+  type RefreshCaptchaResponse,
+  type SearchSubmitResponse,
 } from "@/types/api";
 import { formatCountdown, secondsUntil } from "@/lib/date-format";
 import { STRINGS } from "@/lib/strings";
@@ -137,7 +139,7 @@ export function CaptchaChallenge(props: CaptchaChallengeProps) {
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>): Promise<void> {
     e.preventDefault();
     if (submitting) return;
-    if (text.trim().length < 3) return;
+    if (text.trim().length < MIN_CAPTCHA_LENGTH) return;
 
     setSubmitting(true);
     setStatusMessage(null);
@@ -212,7 +214,11 @@ export function CaptchaChallenge(props: CaptchaChallengeProps) {
     }
   }
 
-  const submitDisabled = submitting || refreshing || text.trim().length < 3 || isExpired;
+  const submitDisabled =
+    submitting ||
+    refreshing ||
+    text.trim().length < MIN_CAPTCHA_LENGTH ||
+    isExpired;
 
   return (
     <form
@@ -304,8 +310,8 @@ export function CaptchaChallenge(props: CaptchaChallengeProps) {
           spellCheck={false}
           value={text}
           onChange={(e) => setText(e.target.value)}
-          maxLength={10}
-          minLength={3}
+          maxLength={MAX_CAPTCHA_LENGTH}
+          minLength={MIN_CAPTCHA_LENGTH}
           disabled={submitting || refreshing}
           className="mt-2 block w-full rounded-md border border-gray-300 bg-white px-3 py-2.5 text-base tracking-widest text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent min-h-[44px]"
         />

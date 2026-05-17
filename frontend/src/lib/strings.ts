@@ -29,8 +29,9 @@ export const STRINGS = {
     title: "Solve the court's CAPTCHA",
     description:
       "We don't bypass court security. Type the characters you see, exactly as shown.",
-    inputLabel: "Type the characters from the image",
-    inputHint: "Minimum 3 characters. Case may matter.",
+    inputLabel: "Type the answer or characters from the image",
+    inputHint:
+      "If the image shows a math question (e.g. 19 + 3 =), type the answer. Otherwise type the characters exactly as shown.",
     refresh: "Refresh CAPTCHA",
     submit: "Submit",
     submitting: "Submitting…",
