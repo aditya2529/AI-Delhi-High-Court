@@ -315,6 +315,75 @@ class TestCaptureRealResponseHappyPath:
         assert b.read_text() == "<b/>"
 
 
+class TestCaptureRealResponseContentTypeRouting:
+    """Post-2026-05-17 pivot: capture must pick the right file extension
+    based on the upstream's content-type (or by sniffing the body if the
+    header wasn't piped through). Saving JSON as .html was the bug Maya
+    flagged on the WPC_2344_2024 capture — these tests pin the fix.
+    """
+
+    def test_json_content_type_lands_as_json(self, tmp_path):
+        """Header explicitly says application/json → .json extension."""
+        target = capture_real_response(
+            raw_html='{"draw":0,"data":[]}',
+            case_type="W.P.(C)", case_number="2344", year=2024,
+            capture_dir=tmp_path,
+            now_unix=1_747_000_000,
+            content_type="application/json; charset=utf-8",
+        )
+        assert target is not None
+        assert target.suffix == ".json"
+        assert target.name == "WPC_2344_2024_1747000000.json"
+
+    def test_html_content_type_lands_as_html(self, tmp_path):
+        """Header says text/html → .html extension (covers the sentinel /
+        error-page path where upstream still serves HTML)."""
+        target = capture_real_response(
+            raw_html="<html><body>err</body></html>",
+            case_type="W.P.(C)", case_number="2344", year=2024,
+            capture_dir=tmp_path,
+            now_unix=1_747_000_000,
+            content_type="text/html; charset=utf-8",
+        )
+        assert target is not None
+        assert target.suffix == ".html"
+
+    def test_sniffs_json_when_no_content_type(self, tmp_path):
+        """No header → sniff body. ``{`` at the start → JSON."""
+        target = capture_real_response(
+            raw_html='{"draw":0,"recordsTotal":0,"data":[]}',
+            case_type="W.P.(C)", case_number="2344", year=2024,
+            capture_dir=tmp_path,
+            now_unix=1_747_000_000,
+            content_type=None,
+        )
+        assert target is not None
+        assert target.suffix == ".json"
+
+    def test_sniffs_html_when_no_content_type(self, tmp_path):
+        """No header → sniff body. ``<`` at the start → HTML."""
+        target = capture_real_response(
+            raw_html="<html>...",
+            case_type="W.P.(C)", case_number="2344", year=2024,
+            capture_dir=tmp_path,
+            now_unix=1_747_000_000,
+        )
+        assert target is not None
+        assert target.suffix == ".html"
+
+    def test_unknown_content_type_falls_back_to_sniffing(self, tmp_path):
+        """Bogus content-type → fall back to body sniff."""
+        target = capture_real_response(
+            raw_html='{"x": 1}',
+            case_type="W.P.(C)", case_number="2344", year=2024,
+            capture_dir=tmp_path,
+            now_unix=1_747_000_000,
+            content_type="application/octet-stream",
+        )
+        assert target is not None
+        assert target.suffix == ".json"
+
+
 class TestCaptureRealResponseFailureModes:
     """Capture failures must NEVER bubble up to the caller — a write
     error must not break a user search."""

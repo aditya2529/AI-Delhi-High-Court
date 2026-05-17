@@ -173,6 +173,28 @@ def redact_html(raw_html: str) -> str:
     return out
 
 
+def _extension_for_body(raw_body: str, content_type: Optional[str]) -> str:
+    """Pick a file extension that matches the body's actual shape.
+
+    Post-2026-05-17 pivot: the live court case-search endpoint returns
+    application/json, NOT HTML. Saving the body as ``.html`` was the
+    bug the founder flagged in the 2026-05-17 capture — fixed here by
+    inspecting either the upstream content-type header (preferred) or
+    sniffing the body (fallback for callers that don't pipe through
+    content-type).
+    """
+    if content_type:
+        ct = content_type.split(";", 1)[0].strip().lower()
+        if "json" in ct:
+            return ".json"
+        if "html" in ct or "xml" in ct:
+            return ".html"
+    # Sniff fallback — JSON envelopes always start with { or [ after lstrip.
+    if raw_body and raw_body.lstrip()[:1] in "{[":
+        return ".json"
+    return ".html"
+
+
 def capture_real_response(
     *,
     raw_html: str,
@@ -181,8 +203,9 @@ def capture_real_response(
     year: int,
     capture_dir: Optional[Path] = None,
     now_unix: Optional[float] = None,
+    content_type: Optional[str] = None,
 ) -> Optional[Path]:
-    """Write the redacted HTML to disk; return the path written.
+    """Write the redacted body to disk; return the path written.
 
     Returns ``None`` if the write failed for any reason (disk full,
     permissions, parent dir creation failed) — capture must never
@@ -193,19 +216,25 @@ def capture_real_response(
     config dependency so it stays unit-testable in isolation.
 
     Args:
-        raw_html: the response body as returned by the upstream.
+        raw_html: the response body as returned by the upstream. The
+            historical name reflects when responses were HTML-only; today
+            this may be either HTML or JSON (see ``content_type``).
         case_type / case_number / year: identity for the filename stem.
         capture_dir: override the default location (used by tests + the
             future "capture into a sprint-specific bucket" hook).
         now_unix: override the timestamp (used by tests for determinism).
+        content_type: the upstream's ``Content-Type`` response header, if
+            available. Drives the file extension (``.json`` for JSON
+            responses, ``.html`` for HTML). If absent, the body is sniffed.
 
-    The filename pattern is ``<safe-case-id>_<unix-int>.html``. Multiple
+    The filename pattern is ``<safe-case-id>_<unix-int>.<ext>``. Multiple
     captures of the same case naturally version by timestamp.
     """
     target_dir = capture_dir if capture_dir is not None else DEFAULT_CAPTURE_DIR
     ts = int(now_unix if now_unix is not None else time.time())
     stem = safe_case_id_for_filename(case_type, case_number, year)
-    target = target_dir / f"{stem}_{ts}.html"
+    ext = _extension_for_body(raw_html, content_type)
+    target = target_dir / f"{stem}_{ts}{ext}"
 
     redacted = redact_html(raw_html)
 

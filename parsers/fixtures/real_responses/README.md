@@ -1,19 +1,26 @@
 # Real-court response fixtures
 
-> **EMPTY ON PURPOSE.** This directory is populated automatically when the
-> founder runs `CLIENT_MODE=real` against `delhihighcourt.nic.in` with
-> `DHC_CAPTURE_REAL_RESPONSES=true` (default). See
-> `backend/app/clients/response_capture.py`.
+> Populated automatically when the founder runs `CLIENT_MODE=real` against
+> `delhihighcourt.nic.in` with `DHC_CAPTURE_REAL_RESPONSES=true` (default).
+> See `backend/app/clients/response_capture.py`.
 
 ## What lands here
 
 Every successful real-client `submit_search` writes the redacted upstream
-HTML body to `<safe-case-id>_<unix-int>.html` in this directory.
+response body to `<safe-case-id>_<unix-int>.<ext>` in this directory.
+
+**Extension is content-aware (post-2026-05-17 pivot):**
+- `.json` when the upstream returned `application/json` (the case-search
+  endpoint — DataTables envelope).
+- `.html` when the upstream returned `text/html` (error pages, sentinels).
+
+If the upstream omits the `Content-Type` header the capture layer sniffs
+the body: leading `{` or `[` → `.json`; anything else → `.html`.
 
 Example after a run against `W.P.(C) 2344/2024`:
 
 ```
-WPC_2344_2024_1747497822.html
+WPC_2344_2024_1747497822.json
 ```
 
 The filename pattern `<safe-case-id>_<unix-int>.html` lets multiple
