@@ -1,9 +1,13 @@
-/* Delhi HC Case Tracker — global stylesheet.
+/* Delhi HC Case Tracker — Apple-inspired dark theme.
  *
- * Tailwind layers + a small set of bespoke utility classes for the
- * pre-existing disclaimer banner and footer (kept as-is, per the SearchFlow
- * brief: "Disclaimer banner stays visible on every page. Already in
- * layout.tsx — don't touch it.").
+ * Strategy:
+ *   1. Set color-scheme: dark so native form controls + scrollbars adopt dark.
+ *   2. CSS variables drive global colors; Tailwind theme mirrors them.
+ *   3. Override common Tailwind utility classes (bg-white, bg-gray-*,
+ *      border-gray-*, text-gray-*) so per-component classes auto-flip without
+ *      having to touch every component file.
+ *   4. Apple-grade typography: 17px base, SF Pro stack, generous line-height
+ *      for high-prescription readability, antialiased rendering everywhere.
  */
 
 @tailwind base;
@@ -11,54 +15,401 @@
 @tailwind utilities;
 
 :root {
-  --color-bg: #f7f8fa;
-  --color-fg: #1d2330;
-  --color-fg-muted: #5b6675;
-  --color-accent: #1b6cb0;
-  --color-warn: #b8860b;
-  --color-danger: #b03a3a;
-  --radius-md: 10px;
+  color-scheme: dark;
+
+  --color-bg: #000000;
+  --color-surface: #1c1c1e;
+  --color-surface-elevated: #2c2c2e;
+  --color-surface-raised: #3a3a3c;
+  --color-border: #38383a;
+  --color-border-subtle: #2c2c2e;
+  --color-fg: #f5f5f7;
+  --color-fg-muted: #c7c7cc;
+  --color-fg-subtle: #98989d;
+  --color-accent: #0a84ff;
+  --color-accent-hover: #409cff;
+  --color-warn: #ff9f0a;
+  --color-danger: #ff453a;
+  --color-success: #30d158;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 22px;
 }
 
-* { box-sizing: border-box; }
+* {
+  box-sizing: border-box;
+}
 
-html, body {
+html,
+body {
   margin: 0;
   padding: 0;
   background: var(--color-bg);
   color: var(--color-fg);
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  font-size: 16px;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 17px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "cv11", "ss01", "ss03";
+}
+
+h1, h2, h3, h4 {
+  letter-spacing: -0.022em;
+  font-weight: 600;
+}
+
+a {
+  color: var(--color-accent);
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+a:hover {
+  color: var(--color-accent-hover);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* ── Selection — Apple blue ───────────────────────────────────────────── */
+::selection {
+  background: rgba(10, 132, 255, 0.35);
+  color: var(--color-fg);
+}
+
+/* ── Native form controls in dark mode ────────────────────────────────── */
+input,
+select,
+textarea,
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--color-fg);
+}
+
+input,
+select,
+textarea {
+  background: var(--color-surface-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.35);
+  background: var(--color-surface-raised);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--color-fg-subtle);
+}
+
+/* ── Scrollbar — Apple feel ───────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(235, 235, 245, 0.18);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(235, 235, 245, 0.28);
+}
+
+/* ── Header — frosted glass ───────────────────────────────────────────── */
+.dhc-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 28px;
+  background: rgba(28, 28, 30, 0.72);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--color-border-subtle);
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+
+.dhc-header h1 {
+  font-size: 1.15rem;
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: -0.022em;
+  color: var(--color-fg);
+}
+
+.dhc-disclaimer-badge {
+  font-size: 0.82rem;
+  color: var(--color-warn);
+  background: rgba(255, 159, 10, 0.12);
+  border: 1px solid rgba(255, 159, 10, 0.28);
+  padding: 6px 12px;
+  border-radius: 999px;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+/* ── Main + footer ────────────────────────────────────────────────────── */
+.dhc-main {
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 40px 24px 64px;
+}
+
+.dhc-search-page h2 {
+  font-size: 32px;
+  line-height: 1.15;
+  margin: 0 0 8px;
+  letter-spacing: -0.025em;
+  font-weight: 700;
+}
+
+.dhc-lede {
+  color: var(--color-fg-muted);
+  margin: 0 0 32px;
+  font-size: 18px;
   line-height: 1.5;
 }
 
-.dhc-header {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 12px;
-  padding: 16px 24px; background: #fff; border-bottom: 1px solid #e6e9ee;
+.dhc-footer {
+  padding: 32px 24px 48px;
+  text-align: center;
+  color: var(--color-fg-subtle);
+  font-size: 13px;
+  max-width: 680px;
+  margin: 0 auto;
+  line-height: 1.55;
 }
 
-.dhc-header h1 { font-size: 1.1rem; margin: 0; }
-
-.dhc-disclaimer-badge {
-  font-size: 0.78rem; color: var(--color-warn);
-  background: #fff5e1; border: 1px solid #f0d9a8;
-  padding: 4px 8px; border-radius: 999px;
-  white-space: nowrap;
+.dhc-footer a {
+  color: var(--color-accent);
 }
-
-.dhc-main { max-width: 640px; margin: 0 auto; padding: 24px 16px; }
-.dhc-lede { color: var(--color-fg-muted); margin: 4px 0 24px; }
-.dhc-footer { padding: 24px; text-align: center; color: var(--color-fg-muted); }
-.dhc-footer a { color: var(--color-accent); text-decoration: none; }
 
 @media (max-width: 600px) {
-  .dhc-header { padding: 12px 16px; }
-  .dhc-header h1 { font-size: 1rem; }
-  .dhc-disclaimer-badge { font-size: 0.7rem; }
+  .dhc-header {
+    padding: 14px 18px;
+  }
+  .dhc-header h1 {
+    font-size: 1rem;
+  }
+  .dhc-disclaimer-badge {
+    font-size: 0.72rem;
+    padding: 4px 10px;
+  }
+  .dhc-main {
+    padding: 28px 18px 48px;
+  }
+  .dhc-search-page h2 {
+    font-size: 26px;
+  }
+  .dhc-lede {
+    font-size: 16px;
+  }
 }
 
-/* Respect prefers-reduced-motion for the spinner used in loading states. */
+/* ── Reduced motion ───────────────────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
-  .dhc-spin { animation: none !important; }
+  .dhc-spin {
+    animation: none !important;
+  }
+  * {
+    transition: none !important;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Tailwind utility overrides — flip hardcoded light-mode classes to dark.
+ * Lets us re-skin the entire app without touching component files.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+@layer utilities {
+  .bg-white {
+    background-color: var(--color-surface) !important;
+  }
+  .bg-gray-50 {
+    background-color: var(--color-surface) !important;
+  }
+  .bg-gray-100 {
+    background-color: var(--color-surface-elevated) !important;
+  }
+  .bg-gray-200 {
+    background-color: var(--color-surface-raised) !important;
+  }
+
+  .border-gray-100,
+  .border-gray-200,
+  .border-gray-300 {
+    border-color: var(--color-border) !important;
+  }
+
+  .text-gray-400 {
+    color: var(--color-fg-subtle) !important;
+  }
+  .text-gray-500,
+  .text-gray-600 {
+    color: var(--color-fg-muted) !important;
+  }
+  .text-gray-700,
+  .text-gray-800,
+  .text-gray-900 {
+    color: var(--color-fg) !important;
+  }
+
+  /* Status surface tints — Apple-style alpha fills with high-contrast text.
+   * Backgrounds use ~16% alpha + a stronger border so colored pills read
+   * cleanly on the #000 base. Text uses the bright "light variant" of each
+   * Apple system color so it stays legible at small sizes (e.g. 13px chips).
+   */
+
+  /* RED */
+  .bg-red-50,
+  .bg-red-100 {
+    background-color: rgba(255, 69, 58, 0.16) !important;
+  }
+  .border-red-200,
+  .border-red-300,
+  .border-red-400 {
+    border-color: rgba(255, 99, 89, 0.55) !important;
+  }
+  .text-red-600,
+  .text-red-700,
+  .text-red-800,
+  .text-red-900 {
+    color: #ff8a80 !important;
+  }
+
+  /* AMBER / YELLOW */
+  .bg-amber-50,
+  .bg-amber-100,
+  .bg-yellow-50,
+  .bg-yellow-100 {
+    background-color: rgba(255, 159, 10, 0.18) !important;
+  }
+  .border-amber-200,
+  .border-amber-300,
+  .border-yellow-200,
+  .border-yellow-300 {
+    border-color: rgba(255, 179, 64, 0.6) !important;
+  }
+  .text-amber-600,
+  .text-amber-700,
+  .text-amber-800,
+  .text-amber-900,
+  .text-yellow-700,
+  .text-yellow-800,
+  .text-yellow-900 {
+    color: #ffcf70 !important;
+  }
+
+  /* BLUE */
+  .bg-blue-50,
+  .bg-blue-100 {
+    background-color: rgba(10, 132, 255, 0.18) !important;
+  }
+  .border-blue-200,
+  .border-blue-300,
+  .border-blue-400 {
+    border-color: rgba(78, 163, 255, 0.6) !important;
+  }
+  .text-blue-600,
+  .text-blue-700,
+  .text-blue-800,
+  .text-blue-900 {
+    color: #82baff !important;
+  }
+
+  /* GREEN */
+  .bg-green-50,
+  .bg-green-100 {
+    background-color: rgba(48, 209, 88, 0.16) !important;
+  }
+  .border-green-200,
+  .border-green-300 {
+    border-color: rgba(92, 220, 122, 0.55) !important;
+  }
+  .text-green-600,
+  .text-green-700,
+  .text-green-800,
+  .text-green-900 {
+    color: #88e29c !important;
+  }
+
+  /* PURPLE — was completely missing */
+  .bg-purple-50,
+  .bg-purple-100 {
+    background-color: rgba(191, 90, 242, 0.18) !important;
+  }
+  .border-purple-200,
+  .border-purple-300 {
+    border-color: rgba(218, 143, 255, 0.6) !important;
+  }
+  .text-purple-600,
+  .text-purple-700,
+  .text-purple-800,
+  .text-purple-900 {
+    color: #d8a3ff !important;
+  }
+
+  /* PINK — round out the palette for completeness */
+  .bg-pink-50 {
+    background-color: rgba(255, 55, 95, 0.16) !important;
+  }
+  .border-pink-200 {
+    border-color: rgba(255, 105, 145, 0.55) !important;
+  }
+  .text-pink-600,
+  .text-pink-700,
+  .text-pink-800 {
+    color: #ff8aa3 !important;
+  }
+
+  /* DIVIDERS — used by document lists, etc. */
+  .divide-gray-100 > * + *,
+  .divide-gray-200 > * + * {
+    border-color: var(--color-border) !important;
+  }
+}
+
+/* ── Cards / containers — Apple soft elevation ───────────────────────── */
+@layer components {
+  /* Common card pattern: white-on-light → surface-on-dark with subtle border. */
+  div.rounded-md.border,
+  div.rounded-lg.border,
+  section.rounded-md.border,
+  section.rounded-lg.border {
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset,
+                0 8px 24px rgba(0, 0, 0, 0.35);
+  }
+}
+
+/* ── Buttons — Apple-style primary + ghost ───────────────────────────── */
+button {
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.05s ease, box-shadow 0.15s ease;
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
