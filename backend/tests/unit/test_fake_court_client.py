@@ -64,13 +64,24 @@ class TestSubmitRouting:
         result = await client.submit_search(session=session, captcha_text="ABCDE")
         assert "No records found" in result.raw_html
 
-    async def test_year_1900_returns_court_error_fixture(self):
-        """Test hook: year=1900 surfaces the court-500 fixture."""
+    async def test_case_number_court_error_returns_court_error_fixture(self):
+        """Test hook: explicit sentinel `case_number='COURT_ERROR'` surfaces
+        the court-500 fixture. Replaces the old `year=1900` heuristic, which
+        coupled the selector to in-band schema data."""
         client = FakeCourtClient()
         session = CourtSession(session_id="x", case_type="W.P.(C)",
-                               case_number="1", year=1900)
+                               case_number="COURT_ERROR", year=2024)
         result = await client.submit_search(session=session, captcha_text="X")
         assert "500" in result.raw_html
+        assert "internal server error" in result.raw_html.lower()
+
+    async def test_case_number_court_error_is_case_insensitive(self):
+        """`court_error` / `Court_Error` should also trip the sentinel —
+        the selector normalises with .upper() so callers don't need to."""
+        client = FakeCourtClient()
+        session = CourtSession(session_id="x", case_type="W.P.(C)",
+                               case_number="court_error", year=2024)
+        result = await client.submit_search(session=session, captcha_text="X")
         assert "internal server error" in result.raw_html.lower()
 
 

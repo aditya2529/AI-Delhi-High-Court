@@ -1,8 +1,14 @@
 """Search service — orchestrates the CAPTCHA round-trip.
 
 Pulls together: SessionStore (cookies + form state), CourtClient (outbound
-to court site or fake), DHCParserV1 (HTML -> ParsedCase), and the
-SQLAlchemy models (audit trail + result cache).
+to court site or fake), DHCParserV1 (HTML -> ParsedCase), and a small set
+of audit/observability tables (search_request, outbound_request_log).
+
+GREEN-ZONE (2026-05-17): parsed court data is **not** persisted. The
+former `parsed_case`/`case_party`/`case_order` table writes have been
+replaced with `InMemoryCaseCache` (process-local, 24h hard TTL). See
+`backend/app/cache/in_memory_case_cache.py` and
+`docs/architecture/DATA-MODEL.md`.
 
 Keep route handlers thin — all the business logic lives here.
 """
@@ -15,6 +21,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cache.in_memory_case_cache import InMemoryCaseCache
 from app.clients.court_client import (
     CaptchaFetchResult,
     CaptchaIncorrectError,
@@ -24,11 +31,7 @@ from app.clients.court_client import (
     OutboundDisabledError,
 )
 from app.clients.fake_court_client import b64_image
-from app.models.case_order import CaseOrder
-from app.models.case_party import CaseParty
 from app.models.outbound_request_log import OutboundRequestLog
-from app.models.parsed_case import ParsedCase as ParsedCaseRow
-from app.models.parser_version import ParserVersion
 from app.models.search_request import SearchRequest
 from app.parsers.case_parser import (
     PARSE_OUTCOME_CAPTCHA_FAILED,
@@ -54,6 +57,13 @@ log = get_logger(__name__)
 
 # How many CAPTCHA attempts a session may make before we force a refresh.
 MAX_CAPTCHA_ATTEMPTS = 3
+
+# Sentinel parser_version_id surfaced on the wire when results came from
+# the in-memory cache. The DB column it used to come from no longer
+# exists; the wire schema still requires `parser_version: int`, so we
+# return 0 to mean "not tracked in DB". Arnav reviewed — acceptable for
+# MVP since the parser_version *string* is still inside ParsedCase.
+_WIRE_PARSER_VERSION_ID = 0
 
 
 def _hash_ip(client_ip: str) -> str:
@@ -235,14 +245,18 @@ async def submit_search(
     store: SessionStore,
     client: CourtClient,
     parser: DHCParserV1,
+    cache: InMemoryCaseCache,
     session_id: str,
     captcha_text: str,
 ) -> Optional[SearchSubmitResponse]:
-    """Submit upstream + parse + persist.
+    """Submit upstream + parse + (cache, do not persist).
 
     Returns None if the session is unknown (route maps to 404).
     Otherwise returns a fully-formed SearchSubmitResponse with the
     body-level `status` set.
+
+    GREEN-ZONE: on success the parsed result is written to the in-memory
+    cache only — never to the database.
     """
     session = await store.get(session_id)
     if session is None:
@@ -266,8 +280,8 @@ async def submit_search(
     if isinstance(outcome, SearchSubmitResponse):
         return outcome  # early-exit on captcha/court/outbound failure
 
-    return await _parse_and_persist(
-        db=db, store=store, parser=parser,
+    return await _parse_and_cache(
+        db=db, store=store, parser=parser, cache=cache,
         session=session, search_req=search_req, result=outcome,
     )
 
@@ -314,16 +328,17 @@ async def _call_upstream_submit(
     return result
 
 
-async def _parse_and_persist(
+async def _parse_and_cache(
     *,
     db: AsyncSession,
     store: SessionStore,
     parser: DHCParserV1,
+    cache: InMemoryCaseCache,
     session: CourtSession,
     search_req: SearchRequest,
     result: CaseSearchResult,
 ) -> SearchSubmitResponse:
-    """Parse upstream HTML, branch on outcome, persist rows."""
+    """Parse upstream HTML, branch on outcome, write to cache (NOT DB)."""
     outcome: ParseOutcome = parser.parse_with_outcome(
         result.raw_html,
         source_url=result.source_url,
@@ -342,7 +357,7 @@ async def _parse_and_persist(
 
     assert outcome.outcome == PARSE_OUTCOME_SUCCESS and outcome.case is not None
     return await _finalise_success(
-        db=db, store=store,
+        db=db, store=store, cache=cache,
         session=session, search_req=search_req, outcome=outcome,
     )
 
@@ -351,22 +366,31 @@ async def _finalise_success(
     *,
     db: AsyncSession,
     store: SessionStore,
+    cache: InMemoryCaseCache,
     session: CourtSession,
     search_req: SearchRequest,
     outcome: ParseOutcome,
 ) -> SearchSubmitResponse:
-    """Success terminal: persist parsed_case, mark audit row, drop session."""
+    """Success terminal: store in in-memory cache, mark audit row, drop session.
+
+    Note: there is no database write for court data. The audit row
+    `search_req` retains case_type/number/year (the *request*), not the
+    parsed *response*.
+    """
     assert outcome.case is not None
-    parsed_row = await _persist_parsed_case(db, outcome.case)
+    await cache.put(
+        session.case_type,
+        session.case_number,
+        session.year,
+        outcome.case,
+    )
+    _ = db  # kept in signature for parity with the audit-only flush below
     search_req.status = "success"
-    search_req.parsed_case_id = parsed_row.id
     search_req.completed_at = datetime.now(timezone.utc)
     await store.delete(session.session_id)
     return SearchSubmitResponse(
         status="success",
-        result=_to_wire(
-            outcome.case, parser_version_id=parsed_row.parser_version_id
-        ),
+        result=_to_wire(outcome.case, parser_version_id=_WIRE_PARSER_VERSION_ID),
         parser_degraded=outcome.parser_degraded,
     )
 
@@ -417,110 +441,6 @@ async def _latest_search_request_for(
     )
     res = await db.execute(stmt)
     return res.scalar_one_or_none()
-
-
-async def _persist_parsed_case(
-    db: AsyncSession, case: ParsedCase
-) -> ParsedCaseRow:
-    """Upsert parsed_case + parties + orders. Cache TTL 24h."""
-    parser_row = await _ensure_parser_version_row(db, case.parser_version)
-    await _evict_existing_parsed_case(db, case)
-
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=86_400)
-    row = ParsedCaseRow(
-        case_type=case.case_type,
-        case_number=case.case_number,
-        year=case.year,
-        court_case_id=None,
-        status=case.status,
-        filing_date=None,
-        next_hearing_date=case.next_hearing_date,
-        raw_html_ref=case.raw_html_hash,
-        parser_version_id=parser_row.id,
-        expires_at=expires_at,
-    )
-    db.add(row)
-    await db.flush()  # need row.id for child FKs
-
-    _add_party_rows(db, row.id, case.parties)
-    _add_order_rows(db, row.id, case.orders, case.judgments)
-
-    await db.flush()
-    return row
-
-
-async def _evict_existing_parsed_case(
-    db: AsyncSession, case: ParsedCase
-) -> None:
-    """Delete-and-insert: the natural-key unique constraint forbids
-    a second row for the same case tuple. Cascades remove parties/orders."""
-    existing = await db.execute(
-        select(ParsedCaseRow).where(
-            ParsedCaseRow.case_type == case.case_type,
-            ParsedCaseRow.case_number == case.case_number,
-            ParsedCaseRow.year == case.year,
-        )
-    )
-    old_row = existing.scalar_one_or_none()
-    if old_row is not None:
-        await db.delete(old_row)
-        await db.flush()
-
-
-def _add_party_rows(
-    db: AsyncSession, parsed_case_id: int, parties: list
-) -> None:
-    """Skip roles outside the (petitioner, respondent) check constraint."""
-    for idx, p in enumerate(parties):
-        if p.role not in ("petitioner", "respondent"):
-            continue
-        db.add(
-            CaseParty(
-                parsed_case_id=parsed_case_id,
-                role=p.role,
-                name=p.name,
-                advocate=None,
-                display_order=idx,
-            )
-        )
-
-
-def _add_order_rows(
-    db: AsyncSession, parsed_case_id: int, orders: list, judgments: list
-) -> None:
-    """Both orders and judgments land in `case_order` — `case_order` doesn't
-    distinguish; we collapse for v1."""
-    for o in (*orders, *judgments):
-        db.add(
-            CaseOrder(
-                parsed_case_id=parsed_case_id,
-                title=o.title[:512],
-                order_date=o.order_date or None,
-                pdf_url=(o.url or "")[:1024] or "(none)",
-            )
-        )
-
-
-async def _ensure_parser_version_row(
-    db: AsyncSession, version_string: str
-) -> ParserVersion:
-    """Find-or-create the parser_version row for the parser revision."""
-    res = await db.execute(
-        select(ParserVersion).where(ParserVersion.version == version_string)
-    )
-    existing = res.scalar_one_or_none()
-    if existing is not None:
-        return existing
-
-    pv = ParserVersion(
-        version=version_string,
-        git_sha="local-dev",
-        is_current=True,
-        notes="auto-created by search_service on first parse",
-    )
-    db.add(pv)
-    await db.flush()
-    return pv
 
 
 async def _log_outbound(

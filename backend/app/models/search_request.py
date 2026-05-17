@@ -5,7 +5,15 @@ success | failed | expired.
 
 The `user_ip_hash` column stores HMAC-SHA256(ip, server_secret), not the
 raw IP. A daily retention job re-hashes rows older than 90 days with a
-rotated secret, severing back-correlation.
+rotated secret, severing back-correlation. **(Anonymisation job is
+documented but not yet implemented — see DATA-MODEL.md §4.1.)**
+
+GREEN-ZONE (2026-05-17): the historical `parsed_case_id` FK was removed
+when court-data tables (`parsed_case` / `case_party` / `case_order`) were
+ripped out. Audit rows now record the request itself, not a pointer to a
+cached row. The on-success cache hit/miss is recorded only in cache
+counters; if forensic correlation is later required, the
+case_type+case_number+year already on this row is enough.
 """
 from __future__ import annotations
 
@@ -29,7 +37,6 @@ from app.models import Base
 if TYPE_CHECKING:
     from app.models.admin_session import AdminSession
     from app.models.outbound_request_log import OutboundRequestLog
-    from app.models.parsed_case import ParsedCase
 
 
 SEARCH_REQUEST_STATUSES = (
@@ -65,16 +72,8 @@ class SearchRequest(Base):
     # Court-side opaque captcha token, only present in the captcha window
     captcha_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    # Optional links
-    parsed_case_id: Mapped[int | None] = mapped_column(
-        Integer,
-        ForeignKey(
-            "parsed_case.id",
-            name="fk_search_request_parsed_case_id_parsed_case",
-            ondelete="SET NULL",
-        ),
-        nullable=True,
-    )
+    # Optional link to an admin session (kept). The parsed_case FK was
+    # removed under the GREEN-ZONE directive (no court-data persistence).
     admin_session_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey(
@@ -111,10 +110,6 @@ class SearchRequest(Base):
     )
 
     # Relationships
-    parsed_case: Mapped["ParsedCase | None"] = relationship(
-        "ParsedCase",
-        back_populates="search_requests",
-    )
     admin_session: Mapped["AdminSession | None"] = relationship(
         "AdminSession",
         back_populates="search_requests",
@@ -147,7 +142,6 @@ class SearchRequest(Base):
         ),
         Index("ix_search_request_created_at", "created_at"),
         Index("ix_search_request_user_ip_hash", "user_ip_hash"),
-        Index("ix_search_request_parsed_case_id", "parsed_case_id"),
     )
 
     def __repr__(self) -> str:  # pragma: no cover - debug helper

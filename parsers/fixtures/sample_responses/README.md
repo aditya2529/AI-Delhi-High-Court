@@ -17,6 +17,6 @@ real, anonymised HTMLs and the parser is re-validated.
 | `CRLMC_999_2023.html` | `CRL.M.C.`, `999`, `2023` | Disposed, 1 petitioner, 1 respondent, 3 orders + 1 judgment |
 | `FAO_1_2025.html` | `FAO`, `1`, `2025` | Fresh case, no orders yet |
 | `NOTFOUND.html` | any unmapped tuple | Court returned "no record" |
-| `COURT_ERROR.html` | tuple `_, _, 1900` | Simulates court 500 page |
+| `COURT_ERROR.html` | `case_number == "COURT_ERROR"` (any case_type / year) | Simulates court 500 page. Previously keyed on `year == 1900`; explicit sentinel is cleaner (selector not coupled to in-band data). |
 
 All names use case-type without dots/parentheses to be filesystem-friendly.

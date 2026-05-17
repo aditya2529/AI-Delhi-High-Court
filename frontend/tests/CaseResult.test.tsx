@@ -57,7 +57,6 @@ function makeParsedCase(overrides: Partial<ParsedCase> = {}): ParsedCase {
     parsed_at: "2026-05-17T09:42:11Z",
     source_url: "https://delhihighcourt.nic.in/case-status?id=xxx",
     parser_version: 3,
-    parse_confidence: 0.9,
     ...overrides,
   };
 }
@@ -97,17 +96,20 @@ d("CaseResult — renders parsed fields + source link (US-03)", () => {
     expect(matches.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("shows degraded warning when parse_confidence < 0.4", () => {
-    const data = makeParsedCase({ parse_confidence: 0.2 });
-    render(<CaseResult data={data} onSearchAgain={vi.fn()} />);
+  it("shows degraded warning when parserDegraded prop is true (Bucket 2 drift #1)", () => {
+    render(
+      <CaseResult
+        data={makeParsedCase()}
+        parserDegraded={true}
+        onSearchAgain={vi.fn()}
+      />,
+    );
     const alert = screen.getByRole("alert");
     expect(alert.textContent).toMatch(/couldn't read/i);
   });
 
-  it("does NOT show degraded warning when parse_confidence >= 0.4", () => {
-    const data = makeParsedCase({ parse_confidence: 0.85 });
-    render(<CaseResult data={data} onSearchAgain={vi.fn()} />);
-    // No alert role at all => high confidence path.
+  it("does NOT show degraded warning when parserDegraded is absent/false", () => {
+    render(<CaseResult data={makeParsedCase()} onSearchAgain={vi.fn()} />);
     expect(screen.queryByRole("alert")).toBeNull();
   });
 

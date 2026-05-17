@@ -1,20 +1,20 @@
 """ParserVersion — parser code lineage.
 
-Used to track which parser produced each cached `parsed_case` row, so
-that a parser regression can trigger targeted re-parses of stale rows.
+Used to track which parser version is current. Originally it also linked
+back to `parsed_case` rows so we could re-parse stale cached entries on a
+parser bump, but court data is no longer persisted (GREEN-ZONE, 2026-05-17).
+The table remains for operability metadata (which parser version the
+process is running, when it was deployed) and so a v2 reintroduction of
+cached results — if ever sanctioned — has a stable lineage anchor.
 """
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, List
 
 from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models import Base
-
-if TYPE_CHECKING:
-    from app.models.parsed_case import ParsedCase
 
 
 class ParserVersion(Base):
@@ -39,14 +39,6 @@ class ParserVersion(Base):
         DateTime,
         nullable=False,
         server_default=text("CURRENT_TIMESTAMP"),
-    )
-
-    # Reverse relationships
-    parsed_cases: Mapped[List["ParsedCase"]] = relationship(
-        "ParsedCase",
-        back_populates="parser_version",
-        # RESTRICT on delete — handled at the DB layer; relationship is
-        # informational only.
     )
 
     __table_args__ = (

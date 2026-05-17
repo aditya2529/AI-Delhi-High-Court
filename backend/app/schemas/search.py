@@ -18,14 +18,19 @@ class SearchInitRequest(BaseModel):
     case_type: str = Field(
         ..., min_length=1, max_length=32, examples=["W.P.(C)", "CRL.M.C.", "FAO"]
     )
+    # Digits-only per API-CONTRACT §2, plus the reserved sentinel
+    # "COURT_ERROR" which routes to the COURT_ERROR.html fixture when
+    # CLIENT_MODE=fake (no-op selector under CLIENT_MODE=real). The
+    # sentinel is documented in API-CONTRACT.md §2 (note block).
     case_number: str = Field(
         ...,
         min_length=1,
-        max_length=7,
-        pattern=r"^\d{1,7}$",
+        max_length=16,
+        pattern=r"^(?:\d{1,7}|COURT_ERROR)$",
         examples=["12345"],
     )
-    year: int = Field(..., ge=1900, le=2100, examples=[2024])
+    # Lower bound 1950 mirrors the DB CHECK constraint on parsed_case.year.
+    year: int = Field(..., ge=1950, le=2100, examples=[2024])
 
 
 class SearchSubmitRequest(BaseModel):

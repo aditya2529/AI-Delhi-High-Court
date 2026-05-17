@@ -7,6 +7,31 @@ This repository contains a feasibility MVP that proves a single hypothesis: a la
 
 ---
 
+## 🚧 DO NOT DEPLOY PUBLICLY
+
+> 🚧 **DO NOT DEPLOY PUBLICLY** — this is a GREEN-ZONE private alpha.
+>
+> Until all Phase-0 gates close and counsel signs off, this app must run
+> on localhost or behind HTTP basic auth on a private URL only.
+>
+> Phase-0 gate checklist:
+> - [ ] G1 — Spike: session + CAPTCHA mechanics mapped (Arnav)
+> - [ ] G2 — Terms of Use + robots.txt review (Sneha + counsel)
+> - [ ] G3 — DPDPA classification opinion from counsel
+> - [ ] G4 — Parser ≥80% on 20 real anonymised result pages
+> - [ ] G5 — 5-10 friendly-lawyer testers committed to pilot
+>
+> See docs/EXECUTIVE-SUMMARY.md §2 for the verdict structure.
+
+The frontend ships with three reinforcing rails to keep this build out of public reach:
+
+1. `<meta name="robots" content="noindex, nofollow">` on every page (App Router metadata).
+2. `frontend/public/robots.txt` with `Disallow: /` for crawlers that skip meta tags.
+3. A sticky "PRIVATE ALPHA — DO NOT SHARE" banner that renders whenever
+   `NEXT_PUBLIC_CLIENT_MODE=real`. Pair with the backend's `CLIENT_MODE=real`.
+
+---
+
 ## What's in this repo
 
 ```

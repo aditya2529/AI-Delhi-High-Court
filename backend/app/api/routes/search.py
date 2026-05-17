@@ -9,6 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cache.in_memory_case_cache import InMemoryCaseCache
 from app.clients.court_client import (
     CourtClient,
     CourtClientError,
@@ -25,6 +26,7 @@ from app.schemas.search import (
     SearchSubmitResponse,
 )
 from app.services.dependencies import (
+    get_case_cache,
     get_case_parser,
     get_court_client,
     get_session_store,
@@ -59,18 +61,14 @@ async def search_init(
     client: CourtClient = Depends(get_court_client),
     settings: Settings = Depends(get_settings),
 ) -> SearchInitResponse:
-    """Initialise a search session and ship back the CAPTCHA image."""
-    # The fixture test hook for COURT_ERROR is keyed on year=1900. Our DB
-    # CHECK constraint enforces year >= 1950, so we map 1900 to an early
-    # 503 court_error instead of letting the DB blow up.
-    if body.year < 1950:
-        raise ApiError(
-            code="court_error",
-            message="upstream court site returned an error",
-            http_status=503,
-            retryable=True,
-            hint="The case year is outside the supported range or upstream errored.",
-        )
+    """Initialise a search session and ship back the CAPTCHA image.
+
+    The COURT_ERROR fixture is now selected via `case_number == 'COURT_ERROR'`
+    inside FakeCourtClient (see `app/clients/fake_court_client.py`). Pydantic's
+    `case_number` validator enforces `^\\d{1,7}$`, so a year-based short-circuit
+    here is no longer needed and was removed (was a smell — selectors must be
+    explicit, not derived from in-band data).
+    """
     try:
         return await start_search_session(
             db=db,
@@ -112,6 +110,7 @@ async def search_submit(
     store: SessionStore = Depends(get_session_store),
     client: CourtClient = Depends(get_court_client),
     parser: DHCParserV1 = Depends(get_case_parser),
+    cache: InMemoryCaseCache = Depends(get_case_cache),
 ) -> SearchSubmitResponse:
     """Submit the user's typed CAPTCHA. Returns a 200 body with
     status=success|captcha_failed|expired|not_found|court_error.
@@ -121,12 +120,16 @@ async def search_submit(
     CAPTCHA; telling them their session timed out is friendlier than
     a generic "unknown session" error. The frontend then calls /init
     again — same UX as the documented `retry_url` flow.
+
+    GREEN-ZONE: on success, parsed result is written to the in-memory
+    `cache` only. No DB row stores court data.
     """
     resp = await submit_search(
         db=db,
         store=store,
         client=client,
         parser=parser,
+        cache=cache,
         session_id=body.session_id,
         captcha_text=body.captcha_text.strip(),
     )

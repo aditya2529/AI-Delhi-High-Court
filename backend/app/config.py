@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     session_captcha_ttl_seconds: int = 180
     redis_url: str = "redis://localhost:6379/0"
 
+    # ── Court client selection ───────────────────────────────────────────
+    # `fake`  → FakeCourtClient (fixture-driven; default, GREEN-ZONE safe)
+    # `real`  → DelhiHCClient (stubbed — pending Arnav's Phase-0 spike;
+    #            see docs/SPIKE-REPORT.md). Setting `real` while the client
+    #            is still stubbed logs a startup WARNING; any actual call
+    #            raises NotImplementedError.
+    client_mode: Literal["fake", "real"] = "fake"
+
     # ── Outbound: Delhi High Court ───────────────────────────────────────
     dhc_base_url: str = "https://delhihighcourt.nic.in"
     dhc_user_agent: str = "DelhiHCCaseTracker/0.1"

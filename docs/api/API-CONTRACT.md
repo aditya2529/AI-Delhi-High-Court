@@ -81,7 +81,7 @@ Initialize a search session. Server opens an upstream session, fetches the CAPTC
 | Field | Type | Required | Constraints |
 |---|---|---|---|
 | `case_type` | string | yes | enum, validated against the court's published list; uppercase, e.g. `"W.P.(C)"`, `"CRL.A."` |
-| `case_number` | string | yes | digits only, 1–7 chars; leading zeros stripped |
+| `case_number` | string | yes | digits only, 1–7 chars; leading zeros stripped. Reserved sentinel `"COURT_ERROR"` routes to the COURT_ERROR fixture when `CLIENT_MODE=fake` (no-op selector when `CLIENT_MODE=real`); test plumbing only. |
 | `year` | integer | yes | 1950 ≤ year ≤ current_year |
 
 ### Response 200
@@ -142,6 +142,8 @@ The response is a **discriminated union** on `status`:
 | `court_error` | upstream errored mid-submit | 200 (logical) — body says court_error | show "Court site error; try again" |
 
 **Note** on HTTP status: business-logical outcomes (success/not-found/captcha-failed/expired) are **200 OK** with `status` in body. We reserve 4xx/5xx for **transport-level** problems (validation, rate-limit, server bug, unreachable upstream after retries). This keeps the client's error-handling crisp.
+
+**LOCKED behaviour — wrong/expired CAPTCHA returns HTTP 200:** Wrong-CAPTCHA and expired-CAPTCHA conditions return HTTP `200` with a body-level `status` of `captcha_failed` or `expired` respectively. This is deliberate — the request was structurally valid, the upstream just returned a rejection. Future devs should **NOT** "fix" these to `4xx` (e.g., 422). The frontend dispatches on the body-level `status` field; switching to a 4xx HTTP code would silently break that contract because the JSON envelope changes from a success body to an `error` envelope (see §1.4 rule: "4xx/5xx responses ALWAYS contain `error` and NEVER `result`").
 
 ### Status codes
 
@@ -276,6 +278,56 @@ Recent failed requests (for ops + parser regression triage).
   "count": 42
 }
 ```
+
+### 6.4 POST /api/v1/admin/kill-switch
+
+Flip Sneha's outbound kill-switch (`OUTBOUND_FETCH_ENABLED`) at runtime, without a process restart. The flag is process-local — restarting the backend resets it to the value in the env at boot.
+
+#### Auth
+
+| Header | Required | Notes |
+|---|---|---|
+| `X-Admin-Secret` | yes | constant-time compare against `ADMIN_SHARED_SECRET` env var |
+
+#### Request body
+
+```json
+{ "enabled": true }
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `enabled` | boolean | yes (or `outbound_fetch_enabled`) | target value of the kill-switch |
+| `outbound_fetch_enabled` | boolean | optional alias | accepted as a verbose synonym for `enabled`; if both supplied, `outbound_fetch_enabled` wins |
+
+#### Response 200
+
+```json
+{
+  "outbound_fetch_enabled": false,
+  "note": "outbound_fetch_enabled: true -> false"
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `outbound_fetch_enabled` | boolean | the **new** effective value after the flip |
+| `note` | string | human-readable transition (`previous -> new`); for ops audit logs |
+
+#### Status codes
+
+| Status | Code | Meaning |
+|---|---|---|
+| 200 | — | flag updated; body reflects new value |
+| 400 | `invalid_request` | neither `enabled` nor `outbound_fetch_enabled` provided, or non-boolean |
+| 401 | `unauthorized` | missing or wrong `X-Admin-Secret` |
+| 422 | `invalid_request` | body is not valid JSON / shape (pydantic envelope) |
+
+#### Side-effect contract
+
+When `enabled=false`, every subsequent `POST /api/v1/search/init` (and any other call that would touch the outbound client) returns **`503`** with `error.code = "upstream_blocked"`. In-flight outbound calls are NOT cancelled; the flag is checked at the start of each outbound op.
+
+**State scope:** the flag is held in process memory (`app.runtime_flags`). Restarting the backend resets it to whatever `OUTBOUND_FETCH_ENABLED` is in the environment at boot. Multi-node deploys must coordinate the flip out-of-band (or move the flag to Redis in v2).
 
 ---
 

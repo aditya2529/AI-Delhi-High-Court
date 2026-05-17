@@ -5,8 +5,11 @@
  *
  * Trust markers (per PRD R3, R7 and the SearchFlow brief):
  *   - Every result links back to the upstream court page via `source_url`.
- *   - When `parse_confidence < 0.4`, we surface a degraded warning that
- *     directs the user to the official source.
+ *   - When the backend sets `parser_degraded: true` on the submit response,
+ *     we surface a degraded warning that directs the user to the official
+ *     source. (The legacy `parse_confidence` field was removed from the UI
+ *     contract — Bucket 2 drift #1. `parser_degraded` is now the sole
+ *     authoritative signal.)
  *   - The footer carries the "unofficial wrapper" disclaimer.
  *
  * Security (per Sneha):
@@ -23,20 +26,19 @@ import { Button } from "@/components/ui/Button";
 
 export type CaseResultProps = {
   readonly data: ParsedCase;
-  /** Backend hint (independent of confidence) that fields are partial. */
+  /**
+   * Authoritative backend hint that the parsed fields are partial. This is
+   * the ONLY input that drives the degraded-warning UI; we no longer derive
+   * it from a client-side confidence threshold.
+   */
   readonly parserDegraded?: boolean;
   /** Parent resets to the form. */
   readonly onSearchAgain: () => void;
 };
 
-const LOW_CONFIDENCE_THRESHOLD = 0.4;
-
 export function CaseResult({ data, parserDegraded, onSearchAgain }: CaseResultProps) {
   const chip = statusToChip(data.status);
-  const showDegraded =
-    Boolean(parserDegraded) ||
-    (typeof data.parse_confidence === "number" &&
-      data.parse_confidence < LOW_CONFIDENCE_THRESHOLD);
+  const showDegraded = parserDegraded === true;
 
   const nextHearing = formatDate(data.next_hearing_date);
   const lastHearing = formatDate(data.last_hearing_date);

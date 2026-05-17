@@ -234,8 +234,12 @@ class TestSearchFlow:
         assert body["result"] is None
 
     async def test_court_error_fixture_returns_court_error_envelope(self, async_client):
-        """US-07: tuple (_, _, 1900) maps to COURT_ERROR.html in FakeCourtClient
-        -> body.status='court_error' (body-level 200) or 503 court_error envelope.
+        """US-07: case_number='COURT_ERROR' maps to COURT_ERROR.html in
+        FakeCourtClient -> body.status='court_error' (body-level 200) or 503
+        court_error envelope.
+
+        Selector was previously `year == 1900` — moved to an explicit
+        case_number sentinel so the routing isn't coupled to schema data.
 
         The contract is ambiguous: API-CONTRACT §3 lists both `200` body-status
         and `503` http-code as valid for upstream errors. Either is acceptable
@@ -243,7 +247,7 @@ class TestSearchFlow:
         and flag the contract gap to Arnav.
         """
         init = await async_client.post("/api/v1/search/init", json={
-            "case_type": "W.P.(C)", "case_number": "1", "year": 1900,
+            "case_type": "W.P.(C)", "case_number": "COURT_ERROR", "year": 2024,
         })
         if _stub_response(init):
             pytest.xfail("search.init is a skeleton (501)")

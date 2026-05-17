@@ -2,8 +2,22 @@
 
 **Owner:** Rohit (Database)
 **Status:** Draft — pending DBA review
-**Last updated:** 2026-05-17
+**Last updated:** 2026-05-17 (GREEN-ZONE rip-out)
 **DB engines targeted:** SQLite 3.40+ (MVP), PostgreSQL 15+ (v2-ready)
+
+> **2026-05-17 GREEN-ZONE update.** Per owner directive: *"NO long-term
+> database storage of court data."* The three court-data tables that
+> previously persisted parsed results — `parsed_case`, `case_party`,
+> `case_order` — have been **removed from the schema**. They are
+> replaced by an in-process TTL'd cache (`app.cache.InMemoryCaseCache`,
+> 24h hard TTL). See §4.8 below. Migration `0002_remove_case_data_tables`
+> drops the tables; its `downgrade()` re-creates them verbatim from 0001
+> so the rip-out is reversible if the directive is ever rescinded.
+>
+> The remaining tables (`search_request`, `outbound_request_log`,
+> `parser_version`, `admin_session`) hold no court data — only audit
+> trail, operability metadata, and admin-auth material — and survive
+> the rip-out.
 
 ---
 
@@ -11,48 +25,43 @@
 
 1. **Engine-portable.** Only column types that exist in both SQLite and PostgreSQL: `Integer`, `String(n)`, `Text`, `DateTime`, `Boolean`, `ForeignKey`. No `JSONB`, no `ARRAY`, no `tsvector`.
 2. **No raw PII.** User IP addresses are hashed (HMAC-SHA256) before storage. No user accounts in MVP.
-3. **Every row is timestamped.** `created_at` + `updated_at` on every table, server-default to current UTC.
-4. **Every FK is named, every FK has an `ON DELETE` rule.** No floating orphans.
-5. **Every column used in a `WHERE` or `JOIN` has an index.** Documented per-table.
-6. **Naming convention** (Alembic):
+3. **No court-data persistence.** GREEN-ZONE directive. The court site is the source of truth; we hold ephemeral, in-process copies only.
+4. **Every row is timestamped.** `created_at` + `updated_at` on every table, server-default to current UTC.
+5. **Every FK is named, every FK has an `ON DELETE` rule.** No floating orphans.
+6. **Every column used in a `WHERE` or `JOIN` has an index.** Documented per-table.
+7. **Naming convention** (Alembic):
    - PK: `pk_<table>`
    - FK: `fk_<table>_<column>_<reftable>`
    - Unique: `uq_<table>_<column>`
    - Index: `ix_<table>_<column>`
    - Check: `ck_<table>_<name>`
-7. **Soft state, not soft delete.** No `is_deleted` columns in v1 — retention jobs hard-delete or anonymize.
+8. **Soft state, not soft delete.** No `is_deleted` columns in v1 — retention jobs hard-delete or anonymize.
 
 ---
 
 ## 2. Query patterns the schema must serve
 
-Drives every index decision below. Source: Arnav's API contract + Arjun's planned service code.
+Drives every index decision below. Source: Arnav's API contract + Arjun's service code.
 
 | # | Pattern | Frequency | Driven by |
 |---|---|---|---|
-| Q1 | Look up cached parsed case by `(case_type, case_number, year)` for cache-hit on inbound search | Hot — every search | `POST /search` |
+| Q1 | Look up cached parsed case by `(case_type, case_number, year)` for cache-hit on inbound search | Hot — every search | `POST /search` (in-memory cache, NOT a DB query) |
 | Q2 | Update `search_request` lifecycle by `id` (initialized → captcha_displayed → submitted → success/failed) | Hot | Session FSM |
 | Q3 | List recent `search_request` rows for an admin dashboard, filtered by `status` and `created_at` window | Warm | Admin UI |
-| Q4 | List parties for a given `parsed_case_id` (1-to-N hydrate) | Hot — every cache hit | Parser output assembly |
-| Q5 | List orders for a given `parsed_case_id` | Hot | Same |
 | Q6 | Find all `outbound_request_log` rows in the last N minutes for rate-limit accounting | Warm | Rate limiter |
-| Q7 | Find all `parsed_case` rows older than TTL (24h) for cache eviction | Background | Eviction worker |
-| Q8 | Find all `parsed_case` rows where `parser_version_id < current` for re-parse on parser bump | Rare | Reparse worker |
 | Q9 | Validate `admin_session.token_hash` and check `expires_at > now` | Warm | Admin auth middleware |
-| Q10 | Anonymize `search_request` rows older than 90 days (rotate `user_ip_hash`) | Daily batch | Retention job |
-| Q11 | Delete `outbound_request_log` rows older than 30 days | Daily batch | Retention job |
+| Q10 | Anonymize `search_request` rows older than 90 days (rotate `user_ip_hash`) | Daily batch | Retention job *(not yet implemented — see §5)* |
+| Q11 | Delete `outbound_request_log` rows older than 30 days | Daily batch | Retention job *(not yet implemented — see §5)* |
+
+Q4 / Q5 / Q7 / Q8 from the pre-GREEN-ZONE version of this doc (hydrate parties / orders for a parsed_case, cache eviction scan, reparse-on-bump) **no longer apply** — those queries operated against the now-removed court-data tables. Their equivalents in the in-memory cache need no indexes (Python dict lookup on the natural-key tuple).
 
 ---
 
-## 3. ER diagram
+## 3. ER diagram (post-rip-out)
 
 ```mermaid
 erDiagram
-    SEARCH_REQUEST ||--o| PARSED_CASE : "resolves_to (nullable)"
     SEARCH_REQUEST ||--o{ OUTBOUND_REQUEST_LOG : "triggers"
-    PARSED_CASE ||--o{ CASE_PARTY : "has parties"
-    PARSED_CASE ||--o{ CASE_ORDER : "has orders"
-    PARSED_CASE }o--|| PARSER_VERSION : "parsed_by"
     ADMIN_SESSION ||--o{ SEARCH_REQUEST : "operated_by (optional)"
 
     SEARCH_REQUEST {
@@ -63,49 +72,11 @@ erDiagram
         string status
         string user_ip_hash
         string captcha_token
-        int parsed_case_id FK "nullable"
         int admin_session_id FK "nullable"
         text error_message "nullable"
         datetime captcha_displayed_at
         datetime submitted_at
         datetime completed_at
-        datetime created_at
-        datetime updated_at
-    }
-
-    PARSED_CASE {
-        int id PK
-        string case_type
-        string case_number
-        int year
-        string court_case_id
-        string status
-        string filing_date
-        string next_hearing_date
-        text raw_html_ref "nullable"
-        int parser_version_id FK
-        datetime expires_at
-        datetime created_at
-        datetime updated_at
-    }
-
-    CASE_PARTY {
-        int id PK
-        int parsed_case_id FK
-        string role
-        string name
-        string advocate
-        int display_order
-        datetime created_at
-        datetime updated_at
-    }
-
-    CASE_ORDER {
-        int id PK
-        int parsed_case_id FK
-        string title
-        string order_date
-        string pdf_url
         datetime created_at
         datetime updated_at
     }
@@ -144,13 +115,18 @@ erDiagram
     }
 ```
 
+> Note: `PARSER_VERSION` is intentionally orphaned in the diagram — it
+> used to be the parent of `parsed_case`, but `parsed_case` no longer
+> exists. The table is kept for operability metadata (which parser
+> version a deploy is running, when it was promoted).
+
 ---
 
 ## 4. Per-table specification
 
 ### 4.1 `search_request`
 
-**Purpose:** One row per user click on "Search". Tracks the full lifecycle of one human-driven search attempt. The audit trail for "what did this IP ask the court".
+**Purpose:** One row per user click on "Search". Tracks the full lifecycle of one human-driven search attempt. The audit trail for "what did this IP ask the court". **Stores only the user's request (case identifiers + IP hash) — never the court's response.**
 
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
@@ -161,7 +137,6 @@ erDiagram
 | `status` | String(32) | NOT NULL, default `'initialized'`, CHECK in (`initialized`, `captcha_displayed`, `submitted`, `success`, `failed`, `expired`) | FSM |
 | `user_ip_hash` | String(64) | NOT NULL | HMAC-SHA256(IP, server_secret). Rotated at 90d. |
 | `captcha_token` | String(64) | NULL | opaque court-side token, present only during the captcha window |
-| `parsed_case_id` | Integer | FK → `parsed_case.id` ON DELETE SET NULL, NULL | only set on success |
 | `admin_session_id` | Integer | FK → `admin_session.id` ON DELETE SET NULL, NULL | only if invoked from admin tooling |
 | `error_message` | Text | NULL | populated when status='failed' |
 | `captcha_displayed_at` | DateTime | NULL | |
@@ -170,98 +145,23 @@ erDiagram
 | `created_at` | DateTime | NOT NULL, server-default `CURRENT_TIMESTAMP` | |
 | `updated_at` | DateTime | NOT NULL, server-default `CURRENT_TIMESTAMP`, on update | |
 
+> The pre-GREEN-ZONE `parsed_case_id` FK column has been removed by `0002_remove_case_data_tables`.
+
 **Indexes:**
 - `ix_search_request_status_created_at` (status, created_at DESC) — serves Q3 (admin dashboard listing).
 - `ix_search_request_created_at` (created_at) — serves Q10 (90-day retention scan).
 - `ix_search_request_user_ip_hash` (user_ip_hash) — serves per-IP abuse detection (Sneha will want this).
-- `ix_search_request_parsed_case_id` (parsed_case_id) — FK back-reference for "who searched this case".
 
 **FKs:**
-- `fk_search_request_parsed_case_id_parsed_case` ON DELETE SET NULL (cache can evict; search history survives).
 - `fk_search_request_admin_session_id_admin_session` ON DELETE SET NULL.
 
-**Retention:** 90 days. Daily job re-hashes `user_ip_hash` with a rotated secret so rows become un-correlatable to a real IP but lifecycle metrics still aggregate.
+**Retention:** 90 days. A daily job re-hashes `user_ip_hash` with a rotated secret so rows become un-correlatable to a real IP but lifecycle metrics still aggregate. **Status: not yet implemented — owner decision pending whether to ship in v1 or defer past the spike.**
 
 ---
 
-### 4.2 `parsed_case`
+### 4.2–4.4 `parsed_case`, `case_party`, `case_order` — **REMOVED (GREEN-ZONE)**
 
-**Purpose:** TTL-bounded cache of parsed court results. Keyed on the natural key (case_type, case_number, year). Saves the court from being hammered for the same case repeatedly within the TTL window.
-
-| Column | Type | Constraints | Notes |
-|---|---|---|---|
-| `id` | Integer | PK | |
-| `case_type` | String(32) | NOT NULL | |
-| `case_number` | String(32) | NOT NULL | |
-| `year` | Integer | NOT NULL | |
-| `court_case_id` | String(128) | NULL | internal court-side ID if exposed by the result page |
-| `status` | String(64) | NULL | e.g. "Pending", "Disposed" — as scraped |
-| `filing_date` | String(32) | NULL | stored as ISO string; not all sources are clean dates |
-| `next_hearing_date` | String(32) | NULL | same — stored as string to preserve fidelity |
-| `raw_html_ref` | Text | NULL | pointer/key to raw HTML in object storage (not the HTML itself) |
-| `parser_version_id` | Integer | FK → `parser_version.id` ON DELETE RESTRICT, NOT NULL | RESTRICT — never lose lineage |
-| `expires_at` | DateTime | NOT NULL | created_at + 24h by default |
-| `created_at` | DateTime | NOT NULL, server-default | |
-| `updated_at` | DateTime | NOT NULL, server-default, on update | |
-
-**Constraints:**
-- `uq_parsed_case_natural_key` UNIQUE (case_type, case_number, year) — only one cache entry per real-world case at a time. Re-parses do an UPSERT.
-
-**Indexes:**
-- The natural-key unique constraint above also serves Q1 (cache lookup). No separate index needed.
-- `ix_parsed_case_expires_at` (expires_at) — serves Q7 (cache eviction scan).
-- `ix_parsed_case_parser_version_id` (parser_version_id) — serves Q8 (reparse-on-bump).
-
-**FKs:**
-- `fk_parsed_case_parser_version_id_parser_version` ON DELETE RESTRICT.
-
-**Retention:** Hard-evict when `expires_at < now()`. No archival — the source of truth is the court site.
-
----
-
-### 4.3 `case_party`
-
-**Purpose:** Petitioners and respondents for a parsed case. Separate table because (a) the count is variable, (b) querying "all cases for advocate X" is a likely v2 feature, (c) keeps `parsed_case` row width bounded.
-
-| Column | Type | Constraints | Notes |
-|---|---|---|---|
-| `id` | Integer | PK | |
-| `parsed_case_id` | Integer | FK → `parsed_case.id` ON DELETE CASCADE, NOT NULL | child of parsed_case |
-| `role` | String(16) | NOT NULL, CHECK in (`petitioner`, `respondent`) | |
-| `name` | String(255) | NOT NULL | |
-| `advocate` | String(255) | NULL | |
-| `display_order` | Integer | NOT NULL, default 0 | preserves court-listed ordering |
-| `created_at` | DateTime | NOT NULL, server-default | |
-| `updated_at` | DateTime | NOT NULL, server-default, on update | |
-
-**Indexes:**
-- `ix_case_party_parsed_case_id` (parsed_case_id) — serves Q4 (hydrate parties for a case).
-- `ix_case_party_advocate` (advocate) — cheap, anticipates v2 advocate-search feature; ~tens of thousands of rows max in MVP.
-
-**FKs:**
-- `fk_case_party_parsed_case_id_parsed_case` ON DELETE CASCADE — parties die with the cached case row.
-
----
-
-### 4.4 `case_order`
-
-**Purpose:** Links to judgments/interim orders for a parsed case (PDFs on the court site). 1-to-N from parsed_case.
-
-| Column | Type | Constraints | Notes |
-|---|---|---|---|
-| `id` | Integer | PK | |
-| `parsed_case_id` | Integer | FK → `parsed_case.id` ON DELETE CASCADE, NOT NULL | |
-| `title` | String(512) | NOT NULL | |
-| `order_date` | String(32) | NULL | string for fidelity (same reason as parsed_case dates) |
-| `pdf_url` | String(1024) | NOT NULL | court-hosted URL |
-| `created_at` | DateTime | NOT NULL, server-default | |
-| `updated_at` | DateTime | NOT NULL, server-default, on update | |
-
-**Indexes:**
-- `ix_case_order_parsed_case_id` (parsed_case_id) — serves Q5.
-
-**FKs:**
-- `fk_case_order_parsed_case_id_parsed_case` ON DELETE CASCADE.
+These tables were dropped by migration `0002_remove_case_data_tables`. The replacement is the in-process cache documented in §4.8. The downgrade path in that migration recreates them verbatim (DDL pasted from 0001) so a rollback is faithful, but the directive forbids re-running it without explicit owner sign-off.
 
 ---
 
@@ -295,7 +195,7 @@ erDiagram
 
 ### 4.6 `parser_version`
 
-**Purpose:** Tracks parser code versions. When golden-fixture tests detect a parser regression, we bump version, mark `is_current=True`, and a background job re-parses cached cases against the new version.
+**Purpose:** Tracks parser code versions for operability. Originally also linked back to `parsed_case` rows for re-parse-on-bump; that relationship no longer exists because the cache is in-memory only and a parser bump simply invalidates the cache on restart.
 
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
@@ -308,7 +208,7 @@ erDiagram
 | `updated_at` | DateTime | NOT NULL, server-default, on update | |
 
 **Indexes:**
-- `ix_parser_version_is_current` (is_current) — serves "find current parser version" on every parse.
+- `ix_parser_version_is_current` (is_current) — serves "find current parser version".
 
 **Constraints:**
 - `uq_parser_version_version` UNIQUE (version).
@@ -339,22 +239,55 @@ erDiagram
 
 ---
 
+### 4.8 Caching layer (NOT persisted) — `InMemoryCaseCache`
+
+**Purpose:** Replaces the removed `parsed_case` / `case_party` / `case_order` tables. Saves the court from being hammered for the same case repeatedly within a 24h window, **without** persisting any court data to disk.
+
+**Where it lives:** `backend/app/cache/in_memory_case_cache.py`. One singleton per process, wired via `app.services.dependencies.get_case_cache()`.
+
+**Why in-memory (not Redis, not a DB):** The GREEN-ZONE directive is unambiguous — "NO long-term database storage of court data". A best-effort cleanup-job-against-a-DB is a runtime *promise*, not a *guarantee*. A process-local dict that vanishes on restart is the most honest implementation of the rule.
+
+**Shape:**
+
+| Key | Value |
+|---|---|
+| `(case_type, case_number, year)` (normalised: leading zeros stripped from `case_number`) | `_Entry(case: ParsedCase, expires_at: float)` |
+
+**API (async):**
+
+| Method | Returns | Notes |
+|---|---|---|
+| `get(case_type, case_number, year)` | `ParsedCase \| None` | Single-pass sweep removes any expired keys it encounters. Hits bump `hits`; misses bump `misses`; on-the-fly expirations bump `expirations` AND `misses`. |
+| `put(case_type, case_number, year, case)` | `None` | Overwrites. `expires_at = now + ttl`. |
+| `stats()` | `CacheStats(size, hits, misses, expirations, ttl_seconds)` | For `/api/v1/admin` observability — not yet wired into the admin router (Sneha + Arjun to scope). |
+
+**TTL:** Default 24h (`settings.parsed_case_cache_ttl_seconds = 86_400`). Constructor refuses any value > 86_400 — the directive caps cache at 24h and the cache enforces that ceiling at runtime.
+
+**Concurrency:** One `asyncio.Lock` protects the dict. Single-process FastAPI app. Multi-worker deployments would need Redis (v2 swap; `cache_backend=redis` is rejected at startup until then).
+
+**Restart behaviour:** Cache is wiped. First search for every case after a restart is a guaranteed miss — that's the design.
+
+**No background sweeper:** Eviction happens during `get()`. No `asyncio.create_task` loop in lifespan. One fewer moving part to break.
+
+---
+
 ## 5. Privacy & PII notes (for Sneha)
 
-- We store `user_ip_hash`, **not** raw IPs. Hash is `HMAC-SHA256(ip, server_secret)`; secret rotates every 90 days via the retention job, severing back-correlation.
+- We store `user_ip_hash`, **not** raw IPs. Hash is `HMAC-SHA256(ip, server_secret)`; secret rotates every 90 days via the retention job, severing back-correlation. **The HMAC-with-rotated-secret job is documented but not implemented; today's code uses a plain SHA-256 placeholder, which Sneha must swap before launch.**
 - We store no user identity in MVP. No emails, no names, no accounts.
-- `case_party.name` is public court-record data and is not PII under Indian privacy law (DPDPA s.3 exception for publicly available personal data). Sneha to confirm before launch.
+- We **do not store court data**. Petitioner/respondent names that previously lived in `case_party` are now held only in the in-memory cache and only for the TTL window. They never touch disk.
 - `admin_session` stores `token_hash` only. Raw tokens are shown to the admin once on issue, never again.
 
 ## 6. Migration & rollout
 
-- v1 ships as a single Alembic migration: `0001_initial_schema.py`.
+- v1 shipped with `0001_initial_schema.py`.
+- **GREEN-ZONE follow-on:** `0002_remove_case_data_tables.py` drops the three court-data tables + `search_request.parsed_case_id`. Idempotent-safe (no-op if the tables are already gone, because Alembic tracks revision state in `alembic_version`).
 - SQLite file lives at `backend/data/casetracker.db` (gitignored).
-- Foreign-key enforcement must be enabled per-connection on SQLite: `PRAGMA foreign_keys=ON`. Wired in the engine's `connect` event in `backend/app/db.py` (Arjun's task).
-- Postgres path (v2): same migration runs unmodified. We then add Postgres-specific optimizations as a follow-on migration (partial indexes, `JSONB` for `raw_html_ref` payloads if we move HTML in-DB).
+- Foreign-key enforcement is enabled per-connection on SQLite via `PRAGMA foreign_keys=ON` in `backend/app/db/session.py`.
+- Postgres path (v2): same migrations run unmodified. The `batch_alter_table` in 0002 is a no-op on Postgres.
 
 ## 7. Open questions
 
-- **OQ1:** Should `parsed_case.raw_html_ref` point to object storage (S3) or to a sibling on-disk path? Arnav to decide; schema is agnostic.
-- **OQ2:** Do we need `case_order.pdf_url` to be unique within a case? Court sometimes lists the same order twice. Holding off on the unique constraint until we see real data.
-- **OQ3:** Is `case_party.advocate` ever multi-valued? Spotted some "Mr X with Mr Y" strings in samples. Storing as raw string for v1; normalize in v2 if we ship advocate-search.
+- **OQ1:** Do we surface `cache.stats()` on `/api/v1/admin/cache` for operator visibility? Tiny endpoint; defers to Sneha for whether the snapshot is considered observability-only or admin-only.
+- **OQ2:** Owner call required: do we ship the 90-day `search_request` anonymisation job in v1, or defer past the post-spike review? It is a single async cron, ~30 lines.
+- **OQ3:** If we ever sanction multi-worker deployment in v1, we MUST move the cache out of process. Until then, `cache_backend=redis` is rejected at startup — fail loud, not silently.

@@ -109,13 +109,14 @@ export const ParsedCaseSchema = z
     parsed_at: z.string(),
     source_url: z.string().url(),
     parser_version: z.number().int(),
-    /**
-     * Optional confidence signal. The API contract today does not enumerate
-     * this field; the parsing strategy doc references "parser_degraded" plus
-     * an implicit confidence. We treat it as forward-compatible (passthrough)
-     * and use < 0.4 to trigger the degraded UI per the SearchFlow brief.
+    /*
+     * `parse_confidence` was REMOVED from the UI contract (Bucket 2 drift #1).
+     * The backend's authoritative signal that the parsed result is partial
+     * is `parser_degraded` on the SearchSubmitResponse envelope — see below.
+     * If the backend ever emits `parse_confidence`, `.passthrough()` will
+     * carry it across silently; we deliberately do not key UI behaviour off
+     * it.
      */
-    parse_confidence: z.number().min(0).max(1).nullable().optional(),
   })
   .passthrough();
 export type ParsedCase = z.infer<typeof ParsedCaseSchema>;

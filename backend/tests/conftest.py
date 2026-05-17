@@ -64,6 +64,7 @@ def _test_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.setenv("SESSION_TTL_SECONDS", "600")
     monkeypatch.setenv("ADMIN_SHARED_SECRET", "test-admin-secret")
     monkeypatch.setenv("OUTBOUND_FETCH_ENABLED", "true")
+    monkeypatch.setenv("CLIENT_MODE", "fake")
     # Wipe the lru_cache so each test gets a fresh Settings() object.
     from app.config import get_settings  # local import — env must be set first
     get_settings.cache_clear()

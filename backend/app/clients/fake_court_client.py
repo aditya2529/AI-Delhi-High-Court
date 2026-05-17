@@ -68,13 +68,16 @@ def _fixture_filename(case_type: str, case_number: str, year: int) -> str:
 def _resolve_fixture_path(case_type: str, case_number: str, year: int) -> Path:
     """Resolve to a real fixture path; fallback to NOTFOUND for unknown tuples.
 
-    Special routes (for test hooks, documented in the fixtures README):
-      * year == 1900 → COURT_ERROR.html (simulates upstream 500)
+    Special routes (test hooks, documented in the fixtures README):
+      * `case_number.upper() == 'COURT_ERROR'` → COURT_ERROR.html
+        (simulates upstream 500). Explicit selector by design — the
+        previous `year == 1900` heuristic coupled the test hook to
+        in-band data; explicit sentinel is cleaner.
 
     The real Delhi HC site returns a "no records found" page for any
     unknown case — we mirror that behaviour here for the default path.
     """
-    if year == 1900:
+    if case_number.upper() == "COURT_ERROR":
         return _FIXTURES_DIR / "COURT_ERROR.html"
     direct = _FIXTURES_DIR / _fixture_filename(case_type, case_number, year)
     if direct.is_file():

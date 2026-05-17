@@ -1,0 +1,7 @@
+# Delhi HC Case Tracker — GREEN ZONE / PRIVATE ALPHA
+# This service is NOT for public discovery or indexing.
+# It is a workflow tool for a closed group of lawyer testers.
+# The authoritative case-status page is at https://delhihighcourt.nic.in/.
+
+User-agent: *
+Disallow: /
