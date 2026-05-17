@@ -79,6 +79,19 @@ def _disable_pacing(monkeypatch):
     monkeypatch.setattr(mod, "MIN_REQUEST_SPACING_SECONDS", 0.0)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_capture(monkeypatch, tmp_path):
+    """The post-demo capture path (DelhiHCClient.submit_search →
+    response_capture) defaults to writing into
+    parsers/fixtures/real_responses/. Contract tests that drive
+    submit_search end-to-end would silently pollute that directory.
+    Redirect to a tmp_path AND disable the feature flag belt-and-braces
+    so a failing redirect doesn't quietly leak files."""
+    from app.clients import response_capture as cap_mod
+    monkeypatch.setattr(cap_mod, "DEFAULT_CAPTURE_DIR", tmp_path)
+    monkeypatch.setenv("DHC_CAPTURE_REAL_RESPONSES", "false")
+
+
 def _make_handler(captured: list[httpx.Request]) -> Callable[[httpx.Request], httpx.Response]:
     """Build a MockTransport handler that records calls and returns canned bodies.
 

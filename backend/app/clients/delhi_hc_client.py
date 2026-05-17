@@ -54,6 +54,7 @@ from app.clients.court_client import (
     CourtClientError,
     OutboundDisabledError,
 )
+from app.clients.response_capture import capture_real_response
 from app.config import Settings, get_settings
 from app.runtime_flags import get_flags
 from app.sessions.store import CourtSession
@@ -261,8 +262,22 @@ class DelhiHCClient(CourtClient):
         )
         merged = {**cookies, **self._cookies_from_response(resp)}
         self._write_back_session(session, merged, xsrf)
+        raw_html = resp.text
+        # Persist the redacted body for parser tuning (BLOCKED-ON-FOUNDER
+        # capture path — see backend/app/clients/response_capture.py and
+        # docs/DEMO-FEEDBACK.md "Parser returns 'Not available' against
+        # real HTML"). Gated by DHC_CAPTURE_REAL_RESPONSES so prod can
+        # turn it off without touching code. Failures are swallowed —
+        # capture must never break a user search.
+        if self._settings.dhc_capture_real_responses:
+            capture_real_response(
+                raw_html=raw_html,
+                case_type=session.case_type,
+                case_number=session.case_number,
+                year=session.year,
+            )
         return CaseSearchResult(
-            raw_html=resp.text,
+            raw_html=raw_html,
             parsed_at_unix=time.time(),
             source_url=str(self._client.base_url.join(ENDPOINT_SUBMIT)),
         )

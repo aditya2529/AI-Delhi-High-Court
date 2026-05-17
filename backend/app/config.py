@@ -58,6 +58,14 @@ class Settings(BaseSettings):
     dhc_outbound_rate_limit_per_sec: float = 0.33
     dhc_respect_robots_txt: bool = True
     dhc_hostname_allowlist: str = "delhihighcourt.nic.in"
+    # When True (default in dev), every successful real-client submit
+    # response body is redacted + written to
+    # ``parsers/fixtures/real_responses/<case-id>_<unix>.html`` so the
+    # parser can be tuned against real HTML next sprint. Set False in
+    # production — capture is for development/QA only.
+    # See ``backend/app/clients/response_capture.py`` for the redaction
+    # rules + Sneha's privacy guard rails.
+    dhc_capture_real_responses: bool = True
 
     # ── Caching ──────────────────────────────────────────────────────────
     parsed_case_cache_ttl_seconds: int = 86_400
