@@ -114,6 +114,52 @@ def _pending_key(case_type: str, case_number: str, year: int) -> str:
     return f"{case_type}|{case_number}|{year}"
 
 
+def _ms_since(started_unix: float) -> int:
+    """Elapsed-ms helper for structured-log timings. Truncates to int."""
+    return int((time.time() - started_unix) * 1000)
+
+
+def _log_step(
+    *,
+    agent: str,
+    case_type: str,
+    case_number: str,
+    year: int,
+    http_status: Optional[int],
+    elapsed_ms: int,
+    cookie_names: tuple[str, ...],
+    outcome: str,
+    error: Optional[str] = None,
+) -> None:
+    """Emit a one-line structured trace for an init|validate|submit step.
+
+    Why a single helper: the founder needs to be able to grep for one
+    `request_id` and get the full step-by-step trail. Centralising the
+    event name (`dhc.step`) + field set makes the grep deterministic and
+    keeps drift between init/validate/submit log shapes to zero.
+
+    NOTE: cookie *names* only — never values. The XSRF + session cookies
+    are Laravel-encrypted but still session-scoped secrets; we log their
+    presence, not their content. `request_id` is intentionally NOT
+    threaded here — that's a request-scope contextvar handled by the
+    route layer's logging middleware, and structlog's
+    `merge_contextvars` processor will splice it onto every record
+    automatically.
+    """
+    log.info(
+        "dhc.step",
+        agent=agent,
+        case_type=case_type,
+        case_number=case_number,
+        year=year,
+        http_status=http_status,
+        elapsed_ms=elapsed_ms,
+        cookie_names=list(cookie_names),
+        outcome=outcome,
+        error=error,
+    )
+
+
 class DelhiHCClient(CourtClient):
     """Real Delhi High Court outbound client.
 
@@ -184,10 +230,27 @@ class DelhiHCClient(CourtClient):
         self._guard_outbound_enabled()
         self._guard_hostname_allowed(self._settings.dhc_base_url)
 
-        resp = await self._request("GET", ENDPOINT_FORM_PAGE)
+        started = time.time()
+        try:
+            resp = await self._request("GET", ENDPOINT_FORM_PAGE)
+        except CourtClientError as exc:
+            _log_step(
+                agent="init", case_type=case_type, case_number=case_number,
+                year=year, http_status=None, elapsed_ms=_ms_since(started),
+                cookie_names=(), outcome="exception", error=str(exc)[:200],
+            )
+            raise
         cookies = self._cookies_from_response(resp)
         xsrf_raw = cookies.get(COOKIE_XSRF, "")
         if not xsrf_raw:
+            _log_step(
+                agent="init", case_type=case_type, case_number=case_number,
+                year=year, http_status=resp.status_code,
+                elapsed_ms=_ms_since(started),
+                cookie_names=tuple(sorted(cookies.keys())),
+                outcome="http_error",
+                error="upstream did not set XSRF-TOKEN cookie",
+            )
             raise CourtClientError(
                 "Init failed: upstream did not set XSRF-TOKEN cookie"
             )
@@ -195,6 +258,13 @@ class DelhiHCClient(CourtClient):
             cookies=cookies, xsrf_token=_decode_xsrf(xsrf_raw)
         )
         self._pending[_pending_key(case_type, case_number, year)] = pending
+        _log_step(
+            agent="init", case_type=case_type, case_number=case_number,
+            year=year, http_status=resp.status_code,
+            elapsed_ms=_ms_since(started),
+            cookie_names=tuple(sorted(cookies.keys())),
+            outcome="success",
+        )
         return {
             "case_type": case_type,
             "case_number": case_number,
@@ -255,14 +325,44 @@ class DelhiHCClient(CourtClient):
         if self._validate_before_submit:
             await self._validate_captcha(
                 cookies=cookies, xsrf=xsrf, captcha_text=captcha_text,
+                case_type=session.case_type,
+                case_number=session.case_number,
+                year=session.year,
             )
 
-        resp = await self._post_form(
-            ENDPOINT_SUBMIT, body=body, cookies=cookies, xsrf=xsrf,
-        )
+        started = time.time()
+        try:
+            resp = await self._post_form(
+                ENDPOINT_SUBMIT, body=body, cookies=cookies, xsrf=xsrf,
+            )
+        except CaptchaIncorrectError as exc:
+            _log_step(
+                agent="submit", case_type=session.case_type,
+                case_number=session.case_number, year=session.year,
+                http_status=None, elapsed_ms=_ms_since(started),
+                cookie_names=tuple(sorted(cookies.keys())),
+                outcome="captcha_failed", error=str(exc)[:200],
+            )
+            raise
+        except CourtClientError as exc:
+            _log_step(
+                agent="submit", case_type=session.case_type,
+                case_number=session.case_number, year=session.year,
+                http_status=None, elapsed_ms=_ms_since(started),
+                cookie_names=tuple(sorted(cookies.keys())),
+                outcome="http_error", error=str(exc)[:200],
+            )
+            raise
         merged = {**cookies, **self._cookies_from_response(resp)}
         self._write_back_session(session, merged, xsrf)
         raw_html = resp.text
+        _log_step(
+            agent="submit", case_type=session.case_type,
+            case_number=session.case_number, year=session.year,
+            http_status=resp.status_code, elapsed_ms=_ms_since(started),
+            cookie_names=tuple(sorted(merged.keys())),
+            outcome="success",
+        )
         # Persist the redacted body for parser tuning (BLOCKED-ON-FOUNDER
         # capture path — see backend/app/clients/response_capture.py and
         # docs/DEMO-FEEDBACK.md "Parser returns 'Not available' against
@@ -275,6 +375,12 @@ class DelhiHCClient(CourtClient):
                 case_type=session.case_type,
                 case_number=session.case_number,
                 year=session.year,
+                # Post-2026-05-17 pivot: case-search responses are JSON.
+                # Pipe the upstream content-type through so the capture
+                # layer picks the right extension (.json vs .html) and we
+                # never again save a JSON body as .html (the bug Maya
+                # flagged on the captured WPC_2344_2024 fixture).
+                content_type=resp.headers.get("content-type"),
             )
         return CaseSearchResult(
             raw_html=raw_html,
@@ -307,6 +413,9 @@ class DelhiHCClient(CourtClient):
         cookies: dict[str, str],
         xsrf: str,
         captcha_text: str,
+        case_type: str,
+        case_number: str,
+        year: int,
     ) -> None:
         """POST the pre-submit captcha validation. Raises on rejection.
 
@@ -321,18 +430,53 @@ class DelhiHCClient(CourtClient):
         # B.2b RESOLVED: /validateCaptcha body shape confirmed via the
         # real-world submit on 2026-05-17 (see SPIKE-REPORT.md Section G).
         body = {"captcha": captcha_text}
-        resp = await self._post_form(
-            ENDPOINT_VALIDATE_CAPTCHA, body=body,
-            cookies=cookies, xsrf=xsrf, raise_on_4xx=False,
-        )
+        started = time.time()
+        try:
+            resp = await self._post_form(
+                ENDPOINT_VALIDATE_CAPTCHA, body=body,
+                cookies=cookies, xsrf=xsrf, raise_on_4xx=False,
+            )
+        except CourtClientError as exc:
+            _log_step(
+                agent="validate", case_type=case_type,
+                case_number=case_number, year=year,
+                http_status=None, elapsed_ms=_ms_since(started),
+                cookie_names=tuple(sorted(cookies.keys())),
+                outcome="exception", error=str(exc)[:200],
+            )
+            raise
         if 400 <= resp.status_code < 500:
+            _log_step(
+                agent="validate", case_type=case_type,
+                case_number=case_number, year=year,
+                http_status=resp.status_code,
+                elapsed_ms=_ms_since(started),
+                cookie_names=tuple(sorted(cookies.keys())),
+                outcome="captcha_failed",
+            )
             raise CaptchaIncorrectError(
                 f"validateCaptcha rejected captcha: status={resp.status_code}"
             )
         if resp.status_code >= 500:
+            _log_step(
+                agent="validate", case_type=case_type,
+                case_number=case_number, year=year,
+                http_status=resp.status_code,
+                elapsed_ms=_ms_since(started),
+                cookie_names=tuple(sorted(cookies.keys())),
+                outcome="http_error",
+            )
             raise CourtClientError(
                 f"validateCaptcha upstream error: status={resp.status_code}"
             )
+        _log_step(
+            agent="validate", case_type=case_type,
+            case_number=case_number, year=year,
+            http_status=resp.status_code,
+            elapsed_ms=_ms_since(started),
+            cookie_names=tuple(sorted(cookies.keys())),
+            outcome="success",
+        )
 
     async def _post_form(
         self,
@@ -396,6 +540,20 @@ class DelhiHCClient(CourtClient):
         if raise_on_4xx and 400 <= resp.status_code < 500:
             raise CourtClientError(
                 f"{method} {path} returned {resp.status_code}"
+            )
+        # 5xx that survived retry is a transport failure — surface as a
+        # typed error so the route layer maps it to `court_error` instead
+        # of handing the 500 HTML body to the parser. Callers that need to
+        # inspect a 5xx body explicitly can pass `raise_on_4xx=False`
+        # (e.g. /validateCaptcha already does its own status mapping).
+        # Root cause traced 2026-05-17 from the three /2023 case 500s the
+        # founder reported — without this branch, the upstream 500 HTML
+        # reaches `DHCParserV1.parse_with_outcome` and can raise an
+        # unhandled extraction exception, which falls through to the
+        # global 500 handler.
+        if raise_on_4xx and resp.status_code >= 500:
+            raise CourtClientError(
+                f"{method} {path} returned {resp.status_code} after retry"
             )
         return resp
 

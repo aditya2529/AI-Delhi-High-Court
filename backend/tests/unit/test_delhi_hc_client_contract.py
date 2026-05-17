@@ -603,10 +603,12 @@ class TestSendWithRetry:
         get_settings.cache_clear()
         client = DelhiHCClient(transport=httpx.MockTransport(handler))
         try:
-            # 5xx from init_session falls through _request (which only
-            # raises on 4xx by default) into init_session's xsrf check,
-            # which then raises CourtClientError because no XSRF cookie
-            # was set. Either way, the caller sees CourtClientError.
+            # 5xx that survives retry is mapped to CourtClientError by
+            # `_request` itself (added 2026-05-17 to keep upstream 5xx HTML
+            # from leaking into the parser — see DelhiHCClient._request
+            # docstring). The init_session XSRF check is therefore
+            # unreachable on this path; the caller still sees a
+            # CourtClientError, which is the contract under test.
             with pytest.raises(CourtClientError):
                 await client.init_session(
                     case_type="W.P.(C)", case_number="1", year=2024,
@@ -616,4 +618,261 @@ class TestSendWithRetry:
         assert counter["n"] == 2, (
             "MAX_RETRY_ATTEMPTS=1 → exactly 2 sends (1 + 1 retry); "
             "observed %d" % counter["n"]
+        )
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Regression: real-mode submit on /2023 cases returned HTTP 500 on
+# 2026-05-17 (founder report). Root cause: upstream-5xx HTML reaching the
+# parser via _request's pass-through. Lock the contract: upstream 5xx
+# from the submit POST must raise CourtClientError, NOT return raw HTML.
+# ────────────────────────────────────────────────────────────────────────
+
+
+def _make_submit_status_handler(
+    captured: list[httpx.Request],
+    *,
+    submit_response: httpx.Response,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """init + captcha + validate succeed; submit returns the caller's response.
+
+    Used by the upstream-500 regression test: we need init/captcha/validate
+    to succeed all the way through so the submit POST is the one path
+    under test.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        path = request.url.path
+        if request.method == "GET" and path == ENDPOINT_FORM_PAGE:
+            return _form_page_response_with_cookies()
+        if request.method == "GET" and path == ENDPOINT_GET_CAPTCHA:
+            return httpx.Response(
+                200, content=b"\x89PNG\r\n\x1a\nFAKE",
+                headers={"content-type": "image/png"},
+            )
+        if request.method == "POST" and path == ENDPOINT_VALIDATE_CAPTCHA:
+            return httpx.Response(200, json={"status": True, "message": "ok"})
+        if request.method == "POST" and path == ENDPOINT_SUBMIT:
+            return submit_response
+        if request.method == "GET" and path == "/robots.txt":
+            return httpx.Response(404, text="")
+        raise AssertionError(f"unexpected request: {request.method} {path}")
+    return handler
+
+
+class TestSubmit5xxMapping:
+    """Pin the contract for upstream 5xx on the final submit POST.
+
+    Before 2026-05-17 this path silently passed the 500 HTML body to
+    `DHCParserV1.parse_with_outcome`, which could raise unhandled
+    extraction errors → global 500 handler → opaque user-facing failure
+    with only a fresh request_id to grep on. The fix routes 5xx through
+    `CourtClientError`, which the search service maps to
+    `status='court_error'` per API-CONTRACT §3.
+    """
+
+    async def test_submit_500_after_retry_raises_court_client_error(
+        self, _no_sleep,
+    ):
+        """5xx → 5xx on POST /get-case-type-status → CourtClientError, not raw HTML."""
+        recorded: list[httpx.Request] = []
+        handler = _make_submit_status_handler(
+            recorded,
+            submit_response=httpx.Response(
+                500,
+                text="<html><body><h1>500 Internal Server Error</h1></body></html>",
+            ),
+        )
+        client, _ = _mk_client(
+            validate_before_submit=True, handler=handler, captured=recorded,
+        )
+        try:
+            await client.init_session(
+                case_type="W.P.(C)", case_number="6569", year=2023,
+            )
+            session = CourtSession(
+                session_id="sid", case_type="W.P.(C)",
+                case_number="6569", year=2023,
+            )
+            await client.fetch_captcha(session=session)
+            with pytest.raises(CourtClientError) as excinfo:
+                await client.submit_search(session=session, captcha_text="42")
+            # Must NOT be a CaptchaIncorrectError — 5xx is transport, not
+            # a captcha rejection. The route layer relies on this typing
+            # to pick the right user-facing envelope.
+            from app.clients.court_client import CaptchaIncorrectError
+            assert not isinstance(excinfo.value, CaptchaIncorrectError)
+        finally:
+            await client.aclose()
+        # Submit was attempted (1 + 1 retry on 5xx → 2 submit POSTs).
+        submit_calls = [
+            r for r in recorded
+            if r.method == "POST" and r.url.path == ENDPOINT_SUBMIT
+        ]
+        assert len(submit_calls) == 2, (
+            "MAX_RETRY_ATTEMPTS=1 means 2 sends on persistent 5xx; "
+            f"observed {len(submit_calls)}"
+        )
+
+    async def test_submit_500_then_200_recovers_via_retry(self, _no_sleep):
+        """5xx → 200 on submit: caller sees success; the 200 HTML is parsed."""
+        # Counter-style handler tied to ENDPOINT_SUBMIT path only.
+        recorded: list[httpx.Request] = []
+        submit_responses = [
+            httpx.Response(503, text="<html>transient</html>"),
+            httpx.Response(
+                200,
+                text="<html>case results: marker_RETRY_OK</html>",
+            ),
+        ]
+        submit_idx = {"i": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            recorded.append(request)
+            path = request.url.path
+            if request.method == "GET" and path == ENDPOINT_FORM_PAGE:
+                return _form_page_response_with_cookies()
+            if request.method == "GET" and path == ENDPOINT_GET_CAPTCHA:
+                return httpx.Response(
+                    200, content=b"\x89PNG\r\n\x1a\nFAKE",
+                    headers={"content-type": "image/png"},
+                )
+            if request.method == "POST" and path == ENDPOINT_VALIDATE_CAPTCHA:
+                return httpx.Response(200, json={"status": True})
+            if request.method == "POST" and path == ENDPOINT_SUBMIT:
+                i = submit_idx["i"]
+                submit_idx["i"] = min(i + 1, len(submit_responses) - 1)
+                return submit_responses[i]
+            if request.method == "GET" and path == "/robots.txt":
+                return httpx.Response(404, text="")
+            raise AssertionError(f"unexpected request: {request.method} {path}")
+
+        get_settings.cache_clear()
+        client = DelhiHCClient(transport=httpx.MockTransport(handler))
+        try:
+            await client.init_session(
+                case_type="W.P.(C)", case_number="6569", year=2023,
+            )
+            session = CourtSession(
+                session_id="sid", case_type="W.P.(C)",
+                case_number="6569", year=2023,
+            )
+            await client.fetch_captcha(session=session)
+            result = await client.submit_search(
+                session=session, captcha_text="42",
+            )
+        finally:
+            await client.aclose()
+        assert "marker_RETRY_OK" in result.raw_html, (
+            "post-retry 200 body must be the one returned to the caller"
+        )
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Structured logging — the founder asked for one-grep traceability from
+# a request_id to the full step-by-step trail. Pin the event name and
+# field set so future drift fails a test, not a 2am debug session.
+# ────────────────────────────────────────────────────────────────────────
+
+
+class TestStructuredLogging:
+    """Pin the structured-log shape with `structlog.testing.capture_logs`.
+
+    Why not pytest's `caplog`: the unit tests run without
+    `configure_logging()` (no FastAPI app boot), so structlog's stdlib
+    logger factory is not wired through pytest's stdlib capture. The
+    `capture_logs` helper short-circuits structlog's processor chain
+    and records every event as a dict — exactly the shape we want to
+    assert on.
+    """
+
+    async def test_3_step_success_emits_dhc_step_for_each_agent(self):
+        """init + validate + submit each emit a `dhc.step` log with the
+        documented field set.
+        """
+        import structlog
+
+        client, _ = _mk_client(validate_before_submit=True)
+        try:
+            with structlog.testing.capture_logs() as captured:
+                await client.init_session(
+                    case_type="W.P.(C)", case_number="6569", year=2023,
+                )
+                session = CourtSession(
+                    session_id="sid", case_type="W.P.(C)",
+                    case_number="6569", year=2023,
+                )
+                await client.fetch_captcha(session=session)
+                await client.submit_search(session=session, captcha_text="42")
+        finally:
+            await client.aclose()
+
+        steps = [e for e in captured if e.get("event") == "dhc.step"]
+        agents = [e.get("agent") for e in steps]
+        assert "init" in agents, f"init step missing; got {agents}"
+        assert "validate" in agents, f"validate step missing; got {agents}"
+        assert "submit" in agents, f"submit step missing; got {agents}"
+
+        # Every dhc.step event carries the documented field set.
+        required_fields = {
+            "agent", "case_type", "case_number", "year",
+            "http_status", "elapsed_ms", "cookie_names", "outcome",
+        }
+        for ev in steps:
+            missing = required_fields - set(ev.keys())
+            assert not missing, (
+                f"dhc.step missing fields {missing} in event {ev!r}"
+            )
+            # Case tuple matches the user's input.
+            assert ev["case_number"] == "6569"
+            assert ev["year"] == 2023
+            assert ev["outcome"] == "success"
+            # Cookie *names* only — never values. XSRF + session cookies
+            # are session-scoped secrets.
+            assert isinstance(ev["cookie_names"], list)
+            for name in ev["cookie_names"]:
+                assert "=" not in name, "cookie names only, not values"
+
+    async def test_submit_5xx_logs_http_error_outcome(self, _no_sleep):
+        """A 500 on submit must emit a `dhc.step` with outcome=http_error
+        so the trail is grep-able even when the request fails.
+        """
+        import structlog
+
+        recorded: list[httpx.Request] = []
+        handler = _make_submit_status_handler(
+            recorded,
+            submit_response=httpx.Response(
+                500, text="<html>500</html>",
+            ),
+        )
+        client, _ = _mk_client(
+            validate_before_submit=True, handler=handler, captured=recorded,
+        )
+        try:
+            with structlog.testing.capture_logs() as captured:
+                await client.init_session(
+                    case_type="W.P.(C)", case_number="10327", year=2023,
+                )
+                session = CourtSession(
+                    session_id="sid", case_type="W.P.(C)",
+                    case_number="10327", year=2023,
+                )
+                await client.fetch_captcha(session=session)
+                with pytest.raises(CourtClientError):
+                    await client.submit_search(session=session, captcha_text="42")
+        finally:
+            await client.aclose()
+
+        submit_steps = [
+            e for e in captured
+            if e.get("event") == "dhc.step" and e.get("agent") == "submit"
+        ]
+        assert submit_steps, "submit-agent dhc.step must be emitted on failure"
+        assert submit_steps[-1]["outcome"] == "http_error", (
+            f"submit step on 5xx must carry outcome=http_error; "
+            f"got {submit_steps[-1]}"
+        )
+        assert submit_steps[-1]["error"], (
+            "error field must be populated on http_error outcome"
         )
