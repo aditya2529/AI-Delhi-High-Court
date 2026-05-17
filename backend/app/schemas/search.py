@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 from typing import Literal, Optional
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -34,7 +35,12 @@ class SearchInitRequest(BaseModel):
 
 
 class SearchSubmitRequest(BaseModel):
-    session_id: str = Field(..., min_length=8, max_length=64)
+    # session_id is canonical RFC 4122 dashed UUID v4 — see
+    # API-CONTRACT §7.3. Pydantic's UUID type auto-validates the shape,
+    # which kills the DRIFT-001 follow-on bug where a relaxed
+    # min_length/max_length string silently accepted dashless hex
+    # (see docs/DEMO-FEEDBACK.md item #4).
+    session_id: UUID
     captcha_text: str = Field(..., min_length=1, max_length=10)
 
 
@@ -51,7 +57,8 @@ class CaptchaPayload(BaseModel):
 
 
 class SearchInitResponse(CaptchaPayload):
-    session_id: str
+    # Serializes as the canonical RFC 4122 dashed UUID v4 string.
+    session_id: UUID
 
 
 class RefreshCaptchaResponse(CaptchaPayload):

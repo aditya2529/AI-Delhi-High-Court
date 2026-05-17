@@ -20,11 +20,18 @@ from app.sessions.store import CourtSession, InMemorySessionStore
 # ── Happy-path round-trip ──────────────────────────────────────────────────
 
 class TestCreateAndGet:
-    async def test_create_returns_session_with_uuid_hex_id(self, session_store):
-        """S1.1 / AC-2: backend init mints a session_id."""
+    async def test_create_returns_session_with_canonical_uuid_id(self, session_store):
+        """S1.1 / AC-2: backend init mints a session_id in canonical
+        RFC 4122 dashed UUID v4 form (see API-CONTRACT §7.3 and
+        docs/DEMO-FEEDBACK.md item #4 — backend used to emit dashless
+        hex which silently broke the frontend Zod validator)."""
+        from uuid import UUID
         s = await session_store.create("W.P.(C)", "12345", 2024)
         assert isinstance(s.session_id, str)
-        assert len(s.session_id) == 32  # uuid4().hex
+        # Round-trip through UUID — only valid RFC 4122 IDs pass.
+        parsed = UUID(s.session_id)
+        assert parsed.version == 4
+        assert str(parsed) == s.session_id  # canonical (lowercase, dashed)
         assert s.case_type == "W.P.(C)"
         assert s.case_number == "12345"
         assert s.year == 2024

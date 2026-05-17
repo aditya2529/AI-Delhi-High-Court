@@ -6,6 +6,8 @@ the canonical envelope by the middleware in `app.main`.
 """
 from __future__ import annotations
 
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -124,20 +126,23 @@ async def search_submit(
     GREEN-ZONE: on success, parsed result is written to the in-memory
     `cache` only. No DB row stores court data.
     """
+    # Schema validates session_id as a UUID; downstream services key the
+    # store by string. Normalise once at the boundary.
+    session_id_str = str(body.session_id)
     resp = await submit_search(
         db=db,
         store=store,
         client=client,
         parser=parser,
         cache=cache,
-        session_id=body.session_id,
+        session_id=session_id_str,
         captcha_text=body.captcha_text.strip(),
     )
     if resp is None:
         # Distinguish "was once valid but TTL'd" from "never existed".
         # The former is body-level expired (per API-CONTRACT §3 retry_url
         # flow); the latter is 404 (unknown opaque id).
-        if hasattr(store, "was_recently_evicted") and store.was_recently_evicted(body.session_id):
+        if hasattr(store, "was_recently_evicted") and store.was_recently_evicted(session_id_str):
             return SearchSubmitResponse(
                 status="expired",
                 retry_url="/api/v1/search/init",
@@ -158,18 +163,22 @@ async def search_submit(
     summary="Refresh the CAPTCHA image without losing form state",
 )
 async def refresh_captcha(
-    session_id: str,
+    session_id: UUID,
     db: AsyncSession = Depends(get_db),
     store: SessionStore = Depends(get_session_store),
     client: CourtClient = Depends(get_court_client),
     settings: Settings = Depends(get_settings),
 ) -> RefreshCaptchaResponse:
-    """Fetch a fresh CAPTCHA on the existing session. Form fields stay."""
+    """Fetch a fresh CAPTCHA on the existing session. Form fields stay.
+
+    `session_id` is validated as RFC 4122 UUID v4 by FastAPI's path
+    converter — a malformed id never reaches the service layer.
+    """
     payload = await refresh_session_captcha(
         db=db,
         store=store,
         client=client,
-        session_id=session_id,
+        session_id=str(session_id),
         captcha_ttl_seconds=settings.session_captcha_ttl_seconds,
         session_ttl_seconds=settings.session_ttl_seconds,
     )

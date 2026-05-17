@@ -85,8 +85,13 @@ class InMemorySessionStore(SessionStore):
         self._recently_evicted: dict[str, float] = {}
 
     async def create(self, case_type: str, case_number: str, year: int) -> CourtSession:
+        # session_id is the canonical RFC 4122 dashed UUID v4 — see
+        # docs/api/API-CONTRACT.md §7.3 and DEMO-FEEDBACK.md item #4
+        # (DRIFT-001 follow-on). Frontend Zod previously expected this
+        # shape; backend was emitting dashless hex. Canonical format
+        # now matches end-to-end.
         session = CourtSession(
-            session_id=uuid.uuid4().hex,
+            session_id=str(uuid.uuid4()),
             case_type=case_type,
             case_number=case_number,
             year=year,

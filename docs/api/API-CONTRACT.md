@@ -88,7 +88,7 @@ Initialize a search session. Server opens an upstream session, fetches the CAPTC
 
 | Field | Type | Notes |
 |---|---|---|
-| `session_id` | string (uuid4) | opaque to client; used in subsequent calls |
+| `session_id` | string (UUID v4, dashed — see §7.3) | opaque to client; used in subsequent calls |
 | `captcha_image_b64` | string | base64-encoded PNG/JPEG (whatever upstream sends; MIME normalized to PNG when feasible) |
 | `captcha_mime` | string | `"image/png"` \| `"image/jpeg"` |
 | `captcha_expires_at` | string (RFC 3339) | absolute expiry; client should show a countdown |
@@ -116,7 +116,7 @@ Submit the user's CAPTCHA answer. Server submits the form upstream using the sam
 
 | Field | Type | Required | Constraints |
 |---|---|---|---|
-| `session_id` | string (uuid4) | yes | must match an active session |
+| `session_id` | string (UUID v4, dashed — see §7.3) | yes | must match an active session |
 | `captcha_text` | string | yes | 1–10 chars, trimmed; server normalizes case if upstream is case-insensitive (TO BE VERIFIED IN SPIKE) |
 
 ### Response 200
@@ -169,7 +169,7 @@ Re-fetch the CAPTCHA image for an existing session without losing form state. Us
 
 | Param | Type | Notes |
 |---|---|---|
-| `session_id` | string (uuid4) | from /init |
+| `session_id` | string (UUID v4, dashed — see §7.3) | from /init |
 
 ### Response 200
 
@@ -417,6 +417,38 @@ Body-level (`status` field on 200) values:
 | `expired` | CAPTCHA/upstream-session expired |
 | `not_found` | upstream confirmed no such case |
 | `court_error` | upstream errored mid-submit (returned as 200 body so frontend can branch cleanly) |
+
+### 7.3 `session_id` format (LOCKED)
+
+`session_id` is a **canonical RFC 4122 dashed UUID v4** string,
+lowercase, e.g. `6f89d33b-faf8-4834-8959-609e1a6dcabb` (36 chars,
+including the four `-` separators).
+
+This is the **normative** wire format for every appearance of
+`session_id` in this contract:
+
+- `POST /api/v1/search/init` response body
+- `POST /api/v1/search/submit` request body
+- `GET  /api/v1/search/{session_id}/refresh-captcha` path param
+- `GET  /api/v1/admin/sessions` response rows
+
+Servers MUST emit, and clients MAY validate against, the regex
+`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` (the
+Pydantic `UUID` type and the JavaScript `crypto.randomUUID()` output
+both satisfy this).
+
+**Why this is locked:** This shape was the second contract-drift bug
+(see DRIFT-001 — `parse_confidence` vs `parser_degraded`). The 2026-05-17
+founder demo (docs/DEMO-FEEDBACK.md item #4) caught the backend emitting
+dashless 32-char hex (`uuid.uuid4().hex`) while the frontend Zod schema
+required dashed UUID. The fix is on the backend — it now generates and
+validates the dashed form — and the spec is fixed here so a future
+change to either side fails loudly instead of silently.
+
+Backwards-compatible relaxations on the **client validator** side
+(e.g. `min(8).max(64)` in Zod) are tolerated as defensive belt-and-
+braces, but the **server** is the source of truth for the canonical
+shape.
 
 ---
 
