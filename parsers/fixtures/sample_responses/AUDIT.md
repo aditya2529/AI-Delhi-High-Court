@@ -7,6 +7,28 @@ resolution map), `scripts/dev/spike_recon_output.json`
 what Arnav observed on the live court site. This audit feeds the post-B.6
 real-fixture replacement work — it does NOT itself rewrite the fixtures.
 
+## 2026-05-17 demo update — synthetic fixtures DO NOT match real HTML
+
+The founder's CLIENT_MODE=real run today proved the punchline this audit
+hedged against in §"Per-fixture verdicts": the synthetic shape (table-of-rows
+with class-named cells) is NOT what the live Delhi HC site emits.
+Every real submission came back with `parser_degraded=true` and "Not
+available" for every target field, confirming the synthetic fixtures
+were "plausibly shaped" but not actually shaped right.
+
+**Where the real fixtures will live:** `../real_responses/` (gitkept).
+The `DelhiHCClient.submit_search` capture path
+(`backend/app/clients/response_capture.py`) now writes a redacted
+`<safe-case-id>_<unix>.html` to that directory on every successful real
+run. The next CLIENT_MODE=real session will populate it automatically.
+
+**Synthetic fixtures stay frozen until real fixtures land.** Per the
+trigger list at the bottom of this audit, the synthetic suite will be
+moved to `_archived/` once the parser is re-tuned against real shape.
+Until then they remain the regression anchor for the existing parser
+selectors — touching them mid-flight would lose the only known-good
+test surface.
+
 > The synthetic fixtures here are placeholder-quality by design. Until the
 > 20 anonymised real HTMLs land under `parsers/fixtures/real_responses/`,
 > the parser is being developed against this stylised schema. The audit
